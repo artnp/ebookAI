@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="th">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy"
+    content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://*.google.com https://*.gstatic.com https://*.googletagmanager.com https://*.googleadservices.com https://translate.googleapis.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' https://fonts.gstatic.com https://cdn.jsdelivr.net; frame-src 'self' https://gemini.google.com https://aistudio.google.com; img-src 'self' data: blob: https://*.google.com https://*.googleusercontent.com https://*.gstatic.com https://*.youtube.com https://*.ytimg.com https://*.ggpht.com https://googleads.g.doubleclick.net; connect-src 'self' https://cdnjs.cloudflare.com https://api.github.com https://*.google.com https://*.googleapis.com https://*.gstatic.com;">
+  <title>PDF Gemini Reader</title>
+  <link rel="stylesheet" href="styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css" id="katex-css">
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=IBM+Plex+Sans+Thai:wght@300;400;500;600;700&display=swap"
+    rel="stylesheet">
+</head>
+
+<body>
+  <div class="app-wrapper">
+    <header class="app-header">
+      <div class="header-left">
+        <button id="linevoomToggleBtn" class="btn btn-secondary" title="เปิด/ปิด LINE VOOM" style="margin-right: 8px;">
+          <span class="icon">💬</span> LINE VOOM
+        </button>
+        <button id="libraryBtn" class="btn btn-secondary">
+          <span class="icon">🏛️</span>
+          <span class="btn-text">หอสมุด</span>
+        </button>
+        <span id="fileName" class="file-name">ยังไม่ได้เลือกไฟล์</span>
+      </div>
+
+      <div class="header-center">
+        <div class="page-navigation">
+          <button id="prevPage" class="btn btn-icon" title="หน้าก่อนหน้า" disabled>
+            <span class="icon">❮</span>
+          </button>
+          <div class="page-info">
+            <input type="number" id="pageInput" value="1" min="1">
+            <span>/</span>
+            <span id="totalPages">0</span>
+          </div>
+          <button id="nextPage" class="btn btn-icon" title="หน้าถัดไป" disabled>
+            <span class="icon">❯</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="header-right">
+        <div class="batch-size-control"
+          style="display: flex; align-items: center; gap: 6px; margin-right: 12px; border-right: 1px solid var(--border-color); padding-right: 12px;">
+          <label for="batchSizeInput"
+            style="font-size: 12px; color: var(--text-secondary); white-space: nowrap;">สรุปทีละ</label>
+          <input type="number" id="batchSizeInput" value="10" min="1" max="50"
+            style="width: 50px; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-secondary); color: var(--text-primary); text-align: center; font-size: 13px;">
+          <span style="font-size: 12px; color: var(--text-secondary);">หน้า</span>
+        </div>
+        <div class="gemini-controls"
+          style="display: flex; gap: 8px; margin-right: 12px; border-right: 1px solid var(--border-color); padding-right: 12px;">
+          <button id="finishBookBtn" class="btn btn-danger btn-sm" title="จบเล่ม (ลบไฟล์)">
+            <span class="icon">🏁</span> จบเล่ม
+          </button>
+          <button id="manualNextPage" class="btn btn-secondary btn-sm" title="หน้าถัดไป">
+            หน้าถัดไป ❯
+          </button>
+          <button id="resetGemini" class="btn btn-secondary btn-sm" title="รีโหลดหน้า AI ใหม่">
+            <span class="icon">🔄</span> รีเซ็ต
+          </button>
+        </div>
+        <div class="zoom-controls">
+          <button id="zoomOut" class="btn btn-icon" title="ซูมออก">➖</button>
+          <span id="zoomLevel">100%</span>
+          <button id="zoomIn" class="btn btn-icon" title="ซูมเข้า">➕</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="main-layout">
+      <!-- Far Left: LINE VOOM Panel -->
+      <div id="linevoomPanel" class="linevoom-panel" style="display: flex; width: 400px;">
+        <div class="linevoom-content">
+          <webview id="linevoomWebview" partition="persist:linevoom" allowpopups preload="preload-line.js" src="https://linevoom.line.me/user/_dd9JDo889wfojzv17U8LwAKX2-hN4oDNIStQBfQ"></webview>
+        </div>
+        <!-- Iframe Popup Container -->
+        <div id="linevoomPopup" class="linevoom-popup" style="display: none;">
+          <button id="closeLinevoomPopup" class="popup-close-btn" title="ปิดหน้าต่าง">✕</button>
+          <iframe id="linevoomPopupIframe" src=""></iframe>
+        </div>
+      </div>
+      
+      <!-- Left Resizer -->
+      <div id="leftResizer" class="panel-resizer" style="display: block;"></div>
+
+      <!-- Left Side: PDF Viewer -->
+      <div id="pdfSide" class="pdf-side">
+        <main class="pdf-main">
+          <!-- Welcome / Empty State -->
+          <div id="welcomeScreen" class="welcome-screen">
+            <div class="welcome-content">
+              <div class="welcome-icon">📚</div>
+              <h1>PDF Gemini Reader</h1>
+              <p>ลากไฟล์ PDF มาวางที่นี่เพื่อรวบรวมสรุปความรู้ด้วย AI</p>
+              <button id="openFileBtn2" class="btn btn-primary btn-large" style="margin-top: 20px;">
+                เลือกไฟล์ PDF
+              </button>
+
+              <div id="readingHistory" class="history-section" style="display: none; margin-top: 40px;">
+                <h3>อ่านค้างไว้</h3>
+                <div id="historyList" class="history-list"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- PDF View -->
+          <div id="pdfContainer" class="pdf-container" style="display: none;">
+            <canvas id="pdfCanvas"></canvas>
+          </div>
+
+          <!-- Progress Bar -->
+          <div id="progressBar" class="progress-bar" style="display: none;">
+            <div id="progressFill" class="progress-fill"></div>
+            <span id="progressText" class="progress-text">หน้า 1/1 (0%)</span>
+          </div>
+        </main>
+
+        <!-- Library Overlay -->
+        <div id="libraryOverlay" class="library-overlay">
+          <div class="library-header">
+            <h2>หอสมุดของคุณ</h2>
+            <div class="library-actions">
+              <button id="addBookBtn" class="btn btn-primary">
+                <span class="icon">➕</span> เพิ่มหนังสือ
+              </button>
+              <button id="closeLibraryBtn" class="btn btn-icon">✕</button>
+            </div>
+          </div>
+          <div id="bookshelf" class="bookshelf">
+            <!-- Books will be injected here -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Panel Resizer -->
+      <div id="panelResizer" class="panel-resizer"></div>
+
+      <!-- Right Side: Gemini Panel -->
+      <div id="geminiPanel" class="gemini-panel">
+        <div class="gemini-content">
+          <webview id="geminiWebview" src="https://gemini.google.com/app" partition="persist:google_secure_v2"
+            allowpopups></webview>
+        </div>
+
+        <!-- Hidden Data for Reference -->
+        <div id="extractedText" style="display: none;"></div>
+        <button id="copyText" style="display: none;">Copy</button>
+      </div>
+    </div>
+
+  <!-- Share Modal -->
+  <div id="shareModal" class="share-modal">
+    <div class="share-content">
+      <h3 style="margin-bottom: 8px;">แชร์ไปยัง LINE</h3>
+      <div id="sharePreviewContainer" style="display: none; margin-bottom: 12px; text-align: center;">
+        <img id="shareImagePreview" src=""
+          style="max-height: 200px; max-width: 100%; border: 1px solid var(--border-color); border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.2);">
+      </div>
+      <textarea id="shareText" placeholder="ข้อความที่ต้องการแชร์..."></textarea>
+      <div class="share-actions">
+        <button id="cancelShareBtn" class="btn btn-secondary">ยกเลิก</button>
+        <button id="confirmShareBtn" class="btn btn-primary" style="background: #06C755;">
+          <span class="icon">💬</span> โพสต์
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast">แจ้งเตือน</div>
+
+  <script src="app.js"></script>
+</body>
+
+</html>
