@@ -1,0 +1,20 @@
+{
+  "name": "pdf-gemini-reader",
+  "version": "1.0.0",
+  "description": "PDF Reader with Gemini Auto-Summarizer",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev"
+  },
+  "author": "User",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0"
+  },
+  "dependencies": {
+    "@cliqz/adblocker-electron": "^1.34.0",
+    "node-fetch": "^2.7.0",
+    "pdfjs-dist": "^4.0.379"
+  }
+}
