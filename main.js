@@ -33,6 +33,7 @@ function createWindow() {
   session.defaultSession.setUserAgent(chromeUA);
 
   mainWindow.loadFile('index.html');
+  mainWindow.maximize();
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     // Only allow specific google login popups if needed, otherwise default deny/allow
@@ -144,6 +145,7 @@ ipcMain.handle('save-progress', async (event, data) => {
     progress[data.filePath] = {
       currentPage: data.currentPage,
       totalPages: data.totalPages,
+      batchSize: data.batchSize,
       lastRead: new Date().toISOString(),
       fileName: data.fileName
     };
