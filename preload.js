@@ -18,7 +18,5 @@ contextBridge.exposeInMainWorld('electronAPI', {
     saveTempImage: (data) => {
         console.log('[Preload] Calling save-ebook-image-v2');
         return ipcRenderer.invoke('save-ebook-image-v2', data);
-    },
-    triggerLineVoom: (options) => ipcRenderer.invoke('trigger-line-voom', options),
-    onLinevoomPostCreated: (callback) => ipcRenderer.on('linevoom-post-created-forwarded', (event, data) => callback(data))
+    }
 });
