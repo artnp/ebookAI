@@ -748,4 +748,36 @@ input:checked+.toggle-slider:before {
 .popup-close-btn:hover {
   background: #ef4444;
   border-color: #ef4444;
+}
+
+/* Floating Next Page Button on Gemini Panel */
+.floating-next-page-btn {
+  position: absolute;
+  bottom: 80px;
+  right: 25px;
+  z-index: 99999;
+  background: linear-gradient(135deg, #2563eb, #1d4ed8);
+  color: #ffffff;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 24px;
+  padding: 10px 22px;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  outline: none;
+}
+
+.floating-next-page-btn:hover {
+  background: linear-gradient(135deg, #1d4ed8, #1e40af);
+  transform: scale(1.06);
+  box-shadow: 0 8px 24px rgba(37, 99, 235, 0.4);
+}
+
+.floating-next-page-btn:active {
+  transform: scale(0.96);
 }
