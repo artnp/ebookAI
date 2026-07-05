@@ -134,7 +134,10 @@
       <div id="panelResizer" class="panel-resizer"></div>
 
       <!-- Right Side: Gemini Panel -->
-      <div id="geminiPanel" class="gemini-panel">
+      <div id="geminiPanel" class="gemini-panel" style="position: relative;">
+        <button id="floatingNextPageBtn" class="floating-next-page-btn" title="สรุปหน้าถัดไป">
+          <span>หน้าถัดไป ❯</span>
+        </button>
         <div class="gemini-content">
           <webview id="geminiWebview" src="https://gemini.google.com/app" partition="persist:google_secure_v2"
             allowpopups></webview>
