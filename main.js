@@ -8,6 +8,7 @@ let mainWindow;
 
 // Storage path for reading progress
 const progressFilePath = path.join(app.getPath('userData'), 'reading-progress.json');
+const settingsFilePath = path.join(app.getPath('userData'), 'app-settings.json');
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -273,8 +274,66 @@ ipcMain.handle('save-ebook-image-v2', async (event, dataUrl) => {
   }
 });
 
+// Detect Google Accounts via Chromium Network Stack
+ipcMain.handle('detect-accounts', async () => {
+  console.log('[Main] Detecting Google Accounts...');
+  const activeIndices = [];
+  const partitionSession = session.fromPartition('persist:google_secure_v2');
+  const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
+  
+  for (let i = 0; i < 6; i++) {
+    const url = `https://gemini.google.com/u/${i}/app`;
+    try {
+      const response = await partitionSession.fetch(url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': chromeUA
+        }
+      });
+      
+      const status = response.status;
+      const text = await response.text();
+      const titleMatch = text.match(/<title>([^<]*)<\/title>/i);
+      const title = titleMatch ? titleMatch[1] : 'NO_TITLE';
+      const emails = text.match(/[\w.-]+@(?:gmail|googlemail|[\w-]+\.[\w-]+)/gi) || [];
+      console.log(`[Main] Probe account ${i} status: ${status}, title: "${title}", emails found:`, [...new Set(emails)].slice(0, 5));
+      
+      if (status === 200 && title.toLowerCase().includes('gemini')) {
+        activeIndices.push(i);
+      } else {
+        break; // Sequential accounts, stop probing
+      }
+    } catch (error) {
+      console.error(`[Main] Error probing account ${i}:`, error);
+      break;
+    }
+  }
+  return activeIndices;
+});
 
+// Save Application Settings
+ipcMain.handle('save-settings', async (event, data) => {
+  try {
+    fs.writeFileSync(settingsFilePath, JSON.stringify(data, null, 2));
+    return true;
+  } catch (error) {
+    console.error('Error saving settings:', error);
+    return false;
+  }
+});
 
+// Load Application Settings
+ipcMain.handle('load-settings', async () => {
+  try {
+    if (fs.existsSync(settingsFilePath)) {
+      return JSON.parse(fs.readFileSync(settingsFilePath, 'utf-8'));
+    }
+    return null;
+  } catch (error) {
+    console.error('Error loading settings:', error);
+    return null;
+  }
+});
 
 console.log('[Main] All IPC handlers registered.');
 
