@@ -134,13 +134,34 @@
       <div id="panelResizer" class="panel-resizer"></div>
 
       <!-- Right Side: Gemini Panel -->
-      <div id="geminiPanel" class="gemini-panel" style="position: relative;">
-        <button id="floatingNextPageBtn" class="floating-next-page-btn" title="สรุปหน้าถัดไป">
-          <span>หน้าถัดไป ❯</span>
-        </button>
-        <div class="gemini-content">
-          <webview id="geminiWebview" src="https://gemini.google.com/app" partition="persist:google_secure_v2"
+      <div id="geminiPanel" class="gemini-panel">
+        <div class="gemini-header" style="display: flex; align-items: center; justify-content: space-between; padding: 0 16px; border-bottom: 1px solid var(--border-color); background: var(--bg-secondary); height: 60px;">
+          <div style="display: flex; align-items: center; gap: 8px;">
+            <span style="font-size: 13px; font-weight: 600; color: var(--text-primary);">บัญชี:</span>
+            <select id="accountSelect" class="btn btn-secondary btn-sm" style="padding: 4px 8px; border-radius: 6px; background: var(--bg-primary); color: var(--text-primary); border: 1px solid var(--border-color); font-size: 13px; font-weight: 500; cursor: pointer; height: 32px; min-width: 120px;">
+              <option value="0">บัญชี 1 (u/0)</option>
+            </select>
+            <button id="detectAccountsBtn" class="btn btn-secondary btn-sm" title="ตรวจหาบัญชี Google ทั้งหมดที่ลงชื่อเข้าใช้งานอยู่" style="height: 32px; padding: 0 12px; font-size: 13px;">
+              🔍 ตรวจบัญชี
+            </button>
+          </div>
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <label style="display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-secondary); cursor: pointer; user-select: none;">
+              <input type="checkbox" id="autoRotateAccounts" style="cursor: pointer; width: 16px; height: 16px;">
+              <span>สลับบัญชีออโต้</span>
+            </label>
+          </div>
+        </div>
+        <div class="gemini-content" style="position: relative;">
+          <webview id="geminiWebviewA" class="gemini-webview-element" src="https://gemini.google.com/app" partition="persist:google_secure_v2"
             allowpopups></webview>
+          <webview id="geminiWebviewB" class="gemini-webview-element prefetch-hidden" src="https://gemini.google.com/app" partition="persist:google_secure_v2"
+            allowpopups></webview>
+        </div>
+        <div class="gemini-footer">
+          <button id="bottomNextPageBtn" class="btn btn-primary next-page-bottom-btn" title="หน้าถัดไป">
+            หน้าถัดไป ❯
+          </button>
         </div>
 
         <!-- Hidden Data for Reference -->
