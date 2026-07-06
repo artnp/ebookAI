@@ -18,5 +18,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
     saveTempImage: (data) => {
         console.log('[Preload] Calling save-ebook-image-v2');
         return ipcRenderer.invoke('save-ebook-image-v2', data);
-    }
+    },
+    detectAccounts: () => ipcRenderer.invoke('detect-accounts'),
+    saveSettings: (data) => ipcRenderer.invoke('save-settings', data),
+    loadSettings: () => ipcRenderer.invoke('load-settings')
 });
