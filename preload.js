@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
     getAllProgress: () => ipcRenderer.invoke('get-all-progress'),
     cleanupProgress: () => ipcRenderer.invoke('cleanup-progress'),
     getArgs: () => ipcRenderer.invoke('get-args'),
+    convertEpub: (path) => ipcRenderer.invoke('convert-epub', path),
     openExternal: (url) => ipcRenderer.invoke('open-external', url),
     deleteFile: (path) => ipcRenderer.invoke('delete-file', path),
     copyToClipboard: (data) => ipcRenderer.invoke('copy-to-clipboard', data),
