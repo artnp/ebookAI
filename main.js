@@ -233,6 +233,39 @@ ipcMain.handle('delete-file', async (event, filePath) => {
   }
 });
 
+// Convert EPUB to PDF using Python script
+ipcMain.handle('convert-epub', async (event, epubPath) => {
+  try {
+    const pythonScript = path.join(__dirname, 'convertepub2pdf.py');
+    const epubName = path.basename(epubPath).replace(/\.epub$/i, '');
+    const uploadsDir = path.join(__dirname, '.uploads');
+    if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
+    const pdfPath = path.join(uploadsDir, `${epubName}.pdf`);
+
+    return new Promise((resolve) => {
+      exec(`python "${pythonScript}" "${epubPath}" "${pdfPath}"`, {
+        timeout: 120000
+      }, (error, stdout, stderr) => {
+        if (error) {
+          console.error('[EPUB] Convert error:', error.message);
+          resolve(null);
+          return;
+        }
+        console.log('[EPUB] Convert stdout:', stdout);
+        if (stderr) console.error('[EPUB] Convert stderr:', stderr);
+        if (fs.existsSync(pdfPath)) {
+          resolve(pdfPath);
+        } else {
+          resolve(null);
+        }
+      });
+    });
+  } catch (error) {
+    console.error('[EPUB] Convert exception:', error);
+    return null;
+  }
+});
+
 // Get command line arguments (for drag & drop to .bat)
 ipcMain.handle('get-args', () => {
   return process.argv;
