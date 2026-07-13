@@ -508,6 +508,35 @@ input:checked+.toggle-slider:before {
   border: 1px solid var(--error);
 }
 
+/* Unified screenshot + Bigdata upload status */
+.upload-status {
+  position: fixed;
+  left: 50%;
+  bottom: 20px;
+  width: min(420px, calc(100vw - 32px));
+  padding: 14px 16px;
+  border: 1px solid var(--border-color);
+  border-radius: 10px;
+  background: var(--bg-tertiary);
+  box-shadow: var(--shadow-lg);
+  transform: translate(-50%, 120px);
+  opacity: 0;
+  pointer-events: none;
+  transition: transform .25s ease, opacity .25s ease;
+  z-index: 10000;
+}
+
+.upload-status.show { transform: translate(-50%, 0); opacity: 1; }
+.upload-status.success { border-color: var(--success); }
+.upload-status.error { border-color: var(--error); }
+.upload-status-title { font-weight: 700; font-size: .95rem; padding-right: 46px; }
+.upload-status-detail { margin-top: 4px; min-height: 18px; color: var(--text-secondary); font-size: .82rem; }
+.upload-status-track { height: 7px; margin-top: 10px; overflow: hidden; border-radius: 999px; background: var(--bg-secondary); }
+.upload-status-fill { width: 0; height: 100%; border-radius: inherit; background: var(--accent-primary); transition: width .28s ease; }
+.upload-status.success .upload-status-fill { background: var(--success); }
+.upload-status.error .upload-status-fill { background: var(--error); }
+.upload-status-percent { position: absolute; top: 14px; right: 16px; color: var(--text-secondary); font-size: .85rem; font-variant-numeric: tabular-nums; }
+
 /* Library Overlay */
 .library-overlay {
   position: absolute;
@@ -826,4 +855,4 @@ input:checked+.toggle-slider:before {
 
 .next-page-bottom-btn:active {
   transform: translateY(1px);
-}
+}
