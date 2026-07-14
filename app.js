@@ -2049,35 +2049,31 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 addFocusStyles();
                 const responses = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
                 if (responses.length === 0) return;
-                const container = responses[responses.length - 1]; 
+                const container = responses[responses.length - 1];
+                var items = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
                 if (container.dataset.focusInitialized !== 'true') {
+                    if (items.length === 0) return;
                     container.dataset.focusInitialized = 'true';
                     container.classList.add('focus-response-container');
                     container.dataset.focusIndex = '0';
-                    const initialItems = Array.from(container.querySelectorAll('li')).filter(li => li.innerText.trim().length > 5);
-                    if (initialItems.length > 0) {
-                        initialItems[0].classList.add('active-focus');
-                        triggerHighlight(initialItems[0]);
-                        setTimeout(function() { initialItems[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 100);
-                        setTimeout(function() { speakLi(initialItems[0], true); }, 200);
-                    }
+                    items[0].classList.add('active-focus');
+                    triggerHighlight(items[0]);
+                    setTimeout(function() { items[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 100);
                     container.addEventListener('wheel', function(e) {
-                        const currentItems = Array.from(container.querySelectorAll('li')).filter(li => li.innerText.trim().length > 5);
+                        var currentItems = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
                         if (currentItems.length === 0) return;
-                        let idx = parseInt(container.dataset.focusIndex || '0');
+                        var idx = parseInt(container.dataset.focusIndex || '0');
                         if (e.deltaY > 0) { if (idx < currentItems.length - 1) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx++; updateFocus(idx); } }
                         else { if (idx > 0) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx--; updateFocus(idx); } }
                         function updateFocus(idx) { currentItems[idx].classList.add('active-focus'); currentItems[idx].scrollIntoView({ behavior: 'smooth', block: 'center' }); triggerHighlight(currentItems[idx]); container.dataset.focusIndex = idx.toString(); setTimeout(tagThaiKeywords, 50); speakLi(currentItems[idx]); }
                     }, { passive: false });
-
-
-                } else {
-                    // container เคย init แล้ว — only attach ปุ่ม, ไม่ต้อง speakLi ซ้ำ
+                } else if (items.length > 0) {
                     container.querySelectorAll('li').forEach(function(li) { attachSaveBtnToLi(li); });
-                    var syncItems = Array.from(container.querySelectorAll('li')).filter(function(li) { return li.innerText.trim().length > 5; });
                     var syncIdx = parseInt(container.dataset.focusIndex || '0');
-                    if (syncItems[syncIdx] && !syncItems[syncIdx].classList.contains('active-focus')) {
-                        syncItems[syncIdx].classList.add('active-focus');
+                    if (syncIdx >= items.length) syncIdx = 0;
+                    if (!items[syncIdx].classList.contains('active-focus')) {
+                        items[syncIdx].classList.add('active-focus');
+                        triggerHighlight(items[syncIdx]);
                     }
                 }
             }
@@ -2657,24 +2653,44 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                       isBusy = true;
                   }
                   
-                  if(isBusy) { 
-                      if(window.lastStatus !== 'BUSY') { 
-                          console.log('Gemini status: BUSY'); 
-                          window.lastStatus = 'BUSY'; 
-                          window.nextPageTriggered = false; 
-                      } 
+                   if(isBusy) { 
+                       if(window.lastStatus !== 'BUSY') { 
+                           console.log('Gemini status: BUSY'); 
+                           window.lastStatus = 'BUSY'; 
+                           window.nextPageTriggered = false;
+                           autoReadDone = false;
+                       }
                   } 
-                  else { 
-                      if(window.lastStatus !== 'DONE') { 
-                          console.log('__GEMINI_DONE__'); 
-                          window.lastStatus = 'DONE'; 
-                      } 
-                  }
+                   else { 
+                       if(window.lastStatus !== 'DONE') { 
+                           console.log('__GEMINI_DONE__'); 
+                           window.lastStatus = 'DONE'; 
+                           autoReadFirstLi();
+                       } 
+                   }
                } catch(e){}
             }
 
             function handleScroll() {
                 // Natural scroll only. Page advancement is handled exclusively by the Next Page button.
+            }
+
+            var autoReadDone = false;
+            var autoReadRetries = 0;
+            function autoReadFirstLi() {
+                if (autoReadDone) return;
+                var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
+                if (resp.length === 0) return;
+                var c = resp[resp.length - 1];
+                var items = Array.from(c.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
+                if (items.length === 0) { if (autoReadRetries < 20) { autoReadRetries++; setTimeout(autoReadFirstLi, 300); } return; }
+                autoReadDone = true;
+                autoReadRetries = 0;
+                if (window.lastStatus !== 'DONE') { setTimeout(autoReadFirstLi, 500); return; }
+                items[0].classList.add('active-focus');
+                triggerHighlight(items[0]);
+                setTimeout(function() { items[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 100);
+                setTimeout(function() { speakLi(items[0]); }, 300);
             }
 
             // Init
