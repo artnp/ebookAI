@@ -2072,14 +2072,12 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
 
                 } else {
-                    // container เคย init แล้ว — attach ปุ่มให้ li ที่ยังไม่มีปุ่ม
+                    // container เคย init แล้ว — only attach ปุ่ม, ไม่ต้อง speakLi ซ้ำ
                     container.querySelectorAll('li').forEach(function(li) { attachSaveBtnToLi(li); });
-                    // sync active-focus
                     var syncItems = Array.from(container.querySelectorAll('li')).filter(function(li) { return li.innerText.trim().length > 5; });
                     var syncIdx = parseInt(container.dataset.focusIndex || '0');
                     if (syncItems[syncIdx] && !syncItems[syncIdx].classList.contains('active-focus')) {
                         syncItems[syncIdx].classList.add('active-focus');
-                        speakLi(syncItems[syncIdx]);
                     }
                 }
             }
