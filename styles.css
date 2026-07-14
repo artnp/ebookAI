@@ -335,6 +335,10 @@ input:checked+.toggle-slider:before {
   align-items: flex-start;
   background: #000;
   padding: 20px;
+  cursor: grab;
+}
+.pdf-container:active {
+  cursor: grabbing;
 }
 
 #pdfCanvas {
