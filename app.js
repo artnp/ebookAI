@@ -437,6 +437,13 @@ function setupEventListeners() {
             setTimeout(() => injectGeminiScript(webview), 1000);
         });
 
+        function base64ToBlob(b64, mime) {
+            var byteChars = atob(b64);
+            var ab = new ArrayBuffer(byteChars.length);
+            var ia = new Uint8Array(ab);
+            for (var i = 0; i < byteChars.length; i++) { ia[i] = byteChars.charCodeAt(i); }
+            return new Blob([ab], { type: mime });
+        }
         webview.addEventListener('console-message', (e) => {
             const msg = e.message;
             const isPrefetch = isPrefetchGetter();
@@ -503,6 +510,55 @@ function setupEventListeners() {
                     clearTimeout(window.highlightDebounce);
                     window.highlightDebounce = setTimeout(() => highlightContextInPDF(terms), 200);
                 }
+            } else if (msg === '__TTS_STOP_EDGE__') {
+                if (window.__edgeAudio) {
+                    window.__edgeAudio.pause();
+                    window.__edgeAudio.remove();
+                    window.__edgeAudio = null;
+                }
+                webview.executeJavaScript('window.__ttsStop && window.__ttsStop()');
+            } else if (msg.startsWith('__TTS_CACHE__:')) {
+                var cacheText = msg.substring('__TTS_CACHE__:'.length);
+                if (!window.__ttsCache) window.__ttsCache = {};
+                if (window.__ttsCache[cacheText]) return;
+                window.electronAPI.edgeSpeak(cacheText).then(function(res) {
+                    if (res && res.audio) {
+                        window.__ttsCache[cacheText] = { audio: res.audio, duration: res.duration };
+                    }
+                }).catch(function() {});
+            } else if (msg.startsWith('__TTS_EDGE__:')) {
+                if (isPrefetch) return;
+                var edgeText = msg.substring('__TTS_EDGE__:'.length);
+                if (!window.__ttsCache) window.__ttsCache = {};
+                function playTTS(audioData, dur) {
+                    if (window.__edgeAudio) { window.__edgeAudio.pause(); window.__edgeAudio.remove(); }
+                    try {
+                        var audioBlob = base64ToBlob(audioData, 'audio/mpeg');
+                        var audioUrl = URL.createObjectURL(audioBlob);
+                        window.__edgeAudio = new Audio(audioUrl);
+                        window.__edgeAudio.volume = 1;
+                        window.__edgeAudio.play().catch(function(e) { console.error('EdgeTTS play error:', e); });
+                        webview.executeJavaScript('window.__ttsStart && window.__ttsStart(' + dur + ')');
+                        window.__edgeAudio.onended = function() {
+                            URL.revokeObjectURL(audioUrl);
+                            webview.executeJavaScript('window.__ttsStop && window.__ttsStop()');
+                        };
+                    } catch(e) {
+                        console.error('EdgeTTS audio error:', e);
+                        showToast('TTS audio error', 'error');
+                    }
+                }
+                var cached = window.__ttsCache[edgeText];
+                if (cached) { playTTS(cached.audio, cached.duration); return; }
+                window.electronAPI.edgeSpeak(edgeText).then(function(res) {
+                    if (res && res.error) {
+                        console.error('EdgeTTS error:', res.error);
+                        showToast('TTS ล้มเหลว ลองอีกครั้ง', 'error');
+                        return;
+                    }
+                    window.__ttsCache[edgeText] = { audio: res.audio, duration: res.duration };
+                    playTTS(res.audio, res.duration);
+                });
             } else if (msg.startsWith('__HIGHLIGHT_NOW__:')) {
                 if (isPrefetch) return;
                 const terms = msg.substring('__HIGHLIGHT_NOW__:'.length).trim();
@@ -1907,6 +1963,9 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     .active-focus .copy-btn-container { opacity: 1 !important; }
                     .focus-response-container li.active-focus .li-save-btn { opacity: 0.8 !important; }
                     .focus-response-container li .li-save-btn:hover { opacity: 1 !important; background: rgba(249,115,22,0.18) !important; border-color: rgba(249,115,22,0.5) !important; }
+                    .focus-response-container li.tts-speaking-li { border-left: 3px solid #22c55e !important; background: rgba(34, 197, 94, 0.06) !important; }
+                    .focus-response-container li .tts-ch-active { background: rgba(34, 197, 94, 0.4) !important; border-radius: 3px !important; color: #fff !important; text-shadow: 0 0 8px rgba(34,197,94,0.5) !important; }
+                    .focus-response-container li .tts-ch { transition: background 0.15s ease, color 0.15s ease; }
                 \`;
                 const style = document.createElement('style');
                 style.id = 'gemini-focus-styles';
@@ -2000,6 +2059,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                         initialItems[0].classList.add('active-focus');
                         triggerHighlight(initialItems[0]);
                         setTimeout(function() { initialItems[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 100);
+                        setTimeout(function() { speakLi(initialItems[0], true); }, 200);
                     }
                     container.addEventListener('wheel', function(e) {
                         const currentItems = Array.from(container.querySelectorAll('li')).filter(li => li.innerText.trim().length > 5);
@@ -2007,7 +2067,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                         let idx = parseInt(container.dataset.focusIndex || '0');
                         if (e.deltaY > 0) { if (idx < currentItems.length - 1) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx++; updateFocus(idx); } }
                         else { if (idx > 0) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx--; updateFocus(idx); } }
-                        function updateFocus(idx) { currentItems[idx].classList.add('active-focus'); currentItems[idx].scrollIntoView({ behavior: 'smooth', block: 'center' }); triggerHighlight(currentItems[idx]); container.dataset.focusIndex = idx.toString(); setTimeout(tagThaiKeywords, 50); }
+                        function updateFocus(idx) { currentItems[idx].classList.add('active-focus'); currentItems[idx].scrollIntoView({ behavior: 'smooth', block: 'center' }); triggerHighlight(currentItems[idx]); container.dataset.focusIndex = idx.toString(); setTimeout(tagThaiKeywords, 50); speakLi(currentItems[idx]); }
                     }, { passive: false });
 
 
@@ -2019,6 +2079,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     var syncIdx = parseInt(container.dataset.focusIndex || '0');
                     if (syncItems[syncIdx] && !syncItems[syncIdx].classList.contains('active-focus')) {
                         syncItems[syncIdx].classList.add('active-focus');
+                        speakLi(syncItems[syncIdx]);
                     }
                 }
             }
@@ -2147,6 +2208,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     nextLi.scrollIntoView({ behavior: 'smooth', block: 'center' });
                     if (typeof triggerHighlight === 'function') triggerHighlight(nextLi);
                     setTimeout(tagThaiKeywords, 50);
+                    speakLi(nextLi);
                 }
 
                 btn.onmouseenter = function() {
@@ -2205,6 +2267,20 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     }, 1200);
                 };
 
+                // Click on li text to speak
+                li.addEventListener('click', function(e) {
+                    if (e.target.closest('.li-save-btn, .copy-btn-container, button, a')) return;
+                    var c = li.closest('message-content, .model-response-text, [data-test-id="model-response"]');
+                    if (c) {
+                        var items = Array.from(c.querySelectorAll('li')).filter(function(li) { return li.innerText.trim().length > 5; });
+                        items.forEach(function(item) { item.classList.remove('active-focus'); });
+                        li.classList.add('active-focus');
+                        if (c.dataset.focusIndex !== undefined) c.dataset.focusIndex = items.indexOf(li).toString();
+                        triggerHighlight(li);
+                    }
+                    speakLi(li);
+                });
+
                 // แทรกปุ่มต่อท้าย li โดยตรง (inline ไม่ break layout)
                 li.appendChild(btn);
 
@@ -2214,6 +2290,165 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     if (!btn.disabled) btn.style.opacity = li.classList.contains('active-focus') ? '0.7' : '0.25';
                 });
             }
+
+            // --- TTS (Text-to-Speech) for Thai ---
+            var ttsState = { queue: [], speakingLi: null, utterance: null };
+
+            function ttsStop() {
+                if (window.__ttsStop) window.__ttsStop();
+                console.log('__TTS_STOP_EDGE__');
+                if (ttsState.speakingLi) {
+                    var li = ttsState.speakingLi;
+                    ttsRestoreText(li);
+                    li.classList.remove('tts-speaking-li');
+                }
+                ttsState.speakingLi = null;
+            }
+
+            function ttsExtractThai(text) {
+                var out = '';
+                var lastThai = false;
+                for (var i = 0; i < (text || '').length; i++) {
+                    var ch = text[i];
+                    var c = ch.charCodeAt(0);
+                    if (c >= 0x0E00 && c <= 0x0E7F) { out += ch; lastThai = true; }
+                    else if (ch === ' ' && lastThai) { out += ' '; lastThai = false; }
+                    else { lastThai = false; }
+                }
+                return out.trim();
+            }
+
+            function ttsSegmentAndWrap(li) {
+                var walker = document.createTreeWalker(li, NodeFilter.SHOW_TEXT, null, false);
+                var textNodes = [];
+                while (walker.nextNode()) { textNodes.push(walker.currentNode); }
+                var charPos = 0;
+                textNodes.forEach(function(node) {
+                    var text = node.textContent;
+                    var parent = node.parentNode;
+                    var fragment = document.createDocumentFragment();
+                    var i = 0;
+                    while (i < text.length) {
+                        var ch = text[i];
+                        if (/[\u0E00-\u0E7F]/.test(ch)) {
+                            var start = i;
+                            while (i < text.length && /[\u0E00-\u0E7F]/.test(text[i])) { i++; }
+                            var thaiRun = text.substring(start, i);
+                            var g = 0;
+                            while (g < thaiRun.length) {
+                                var groupLen = Math.min(3, thaiRun.length - g);
+                                var group = thaiRun.substring(g, g + groupLen);
+                                var span = document.createElement('span');
+                                span.className = 'tts-ch';
+                                span.dataset.start = charPos.toString();
+                                span.dataset.end = (charPos + group.length).toString();
+                                span.textContent = group;
+                                fragment.appendChild(span);
+                                charPos += group.length;
+                                g += groupLen;
+                            }
+                        } else {
+                            fragment.appendChild(document.createTextNode(ch));
+                            i++;
+                        }
+                    }
+                    parent.replaceChild(fragment, node);
+                });
+            }
+
+            function ttsRestoreText(li) {
+                li.querySelectorAll('.tts-ch').forEach(function(span) {
+                    var text = span.textContent;
+                    span.parentNode.replaceChild(document.createTextNode(text), span);
+                });
+            }
+
+            function ttsGetThaiVoice(cb) {
+                var voices = window.speechSynthesis.getVoices();
+                if (voices.length > 0) {
+                    var match = voices.find(function(v) { return v.lang.startsWith('th') && /pattara|neural|natural/i.test(v.name); });
+                    if (!match) match = voices.find(function(v) { return v.lang.startsWith('th'); });
+                    cb(match || null);
+                    return;
+                }
+                var called = false;
+                function done(v) { if (!called) { called = true; cb(v || null); } }
+                window.speechSynthesis.addEventListener('voiceschanged', function() {
+                    var v2 = window.speechSynthesis.getVoices();
+                    var match2 = v2.find(function(v) { return v.lang.startsWith('th') && /pattara|neural|natural/i.test(v.name); });
+                    if (!match2) match2 = v2.find(function(v) { return v.lang.startsWith('th'); });
+                    done(match2);
+                }, { once: true });
+                setTimeout(function() { done(null); }, 3000);
+            }
+
+            function ttsPrefetchNeighbors(li) {
+                var container = li.closest('message-content, .model-response-text, [data-test-id="model-response"]');
+                if (!container) return;
+                var items = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
+                var idx = items.indexOf(li);
+                if (idx < 0) return;
+                for (var d = -2; d <= 2; d++) {
+                    if (d === 0) continue;
+                    var ni = idx + d;
+                    if (ni >= 0 && ni < items.length) {
+                        var t = ttsExtractThai(items[ni].innerText || '');
+                        if (t) console.log('__TTS_CACHE__:' + t);
+                    }
+                }
+            }
+
+            function speakNatural(li) {
+                var fullText = li.innerText || '';
+                var thaiText = ttsExtractThai(fullText);
+                if (!thaiText) return;
+                ttsState.speakingLi = li;
+                li.classList.add('tts-speaking-li');
+                ttsSegmentAndWrap(li);
+                console.log('__TTS_EDGE__:' + thaiText);
+                ttsPrefetchNeighbors(li);
+                window.__ttsStart = function(duration) {
+                    window.__ttsChars = Array.from(document.querySelectorAll('.tts-ch'));
+                    window.__ttsStartTime = Date.now();
+                    window.__ttsDuration = duration;
+                    function tick() {
+                        var elapsed = (Date.now() - window.__ttsStartTime) / 1000;
+                        var ratio = Math.min(elapsed / window.__ttsDuration, 1);
+                        var idx = Math.floor(ratio * window.__ttsChars.length);
+                        document.querySelectorAll('.tts-ch-active').forEach(function(s) { s.classList.remove('tts-ch-active'); });
+                        if (idx >= 0 && idx < window.__ttsChars.length) {
+                            window.__ttsChars[idx].classList.add('tts-ch-active');
+                        }
+                        if (ratio < 1) {
+                            window.__ttsTimer = setTimeout(tick, 50);
+                        }
+                    }
+                    tick();
+                };
+                window.__ttsStop = function() {
+                    if (window.__ttsTimer) { clearTimeout(window.__ttsTimer); window.__ttsTimer = null; }
+                    window.__ttsChars = [];
+                    document.querySelectorAll('.tts-ch-active').forEach(function(s) { s.classList.remove('tts-ch-active'); });
+                };
+            }
+
+            function speakLi(li, waitForReady) {
+                ttsStop();
+                if (!li) return;
+                if (waitForReady && window.lastStatus !== 'DONE') {
+                    var retries = 0;
+                    var timer = setInterval(function() {
+                        retries++;
+                        if (window.lastStatus === 'DONE' || retries >= 60) {
+                            clearInterval(timer);
+                            speakNatural(li);
+                        }
+                    }, 500);
+                    return;
+                }
+                speakNatural(li);
+            }
+            // --- end TTS ---
 
             function attach() {
                 loadKaTeX();
@@ -3907,7 +4142,8 @@ async function saveAppSettings() {
         await window.electronAPI.saveSettings({
             detectedAccounts,
             currentAccountIndex,
-            isAutoRotateAccounts
+            isAutoRotateAccounts,
+
         });
     } catch (e) {
         console.error('Error saving app settings:', e);
@@ -3928,6 +4164,7 @@ async function loadAppSettings() {
             if (settings.isAutoRotateAccounts !== undefined) {
                 isAutoRotateAccounts = settings.isAutoRotateAccounts;
             }
+
         }
 
         // Update UI
