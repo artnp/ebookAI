@@ -23,5 +23,6 @@ contextBridge.exposeInMainWorld('electronAPI', {
     detectAccounts: () => ipcRenderer.invoke('detect-accounts'),
     saveSettings: (data) => ipcRenderer.invoke('save-settings', data),
     loadSettings: () => ipcRenderer.invoke('load-settings'),
-    getGithubToken: () => ipcRenderer.invoke('get-github-token')
+    getGithubToken: () => ipcRenderer.invoke('get-github-token'),
+    edgeSpeak: (text) => ipcRenderer.invoke('edge-tts-speak', text)
 });
