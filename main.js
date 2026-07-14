@@ -2,7 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, session, shell, screen, clipboard, 
 const path = require('path');
 const fs = require('fs');
 const https = require('https');
-const { exec } = require('child_process');
+const { exec, spawn } = require('child_process');
 
 let mainWindow;
 
@@ -342,6 +342,35 @@ ipcMain.handle('detect-accounts', async () => {
     }
   }
   return activeIndices;
+});
+
+// Edge-TTS via Python
+ipcMain.handle('edge-tts-speak', async (event, text) => {
+  try {
+    const voice = 'th-TH-PremwadeeNeural';
+    const scriptPath = path.join(__dirname, 'edge_tts_speak.py');
+    return new Promise((resolve) => {
+      const proc = spawn('python', [scriptPath, text, voice], { stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      proc.stdout.on('data', (d) => stdout += d.toString());
+      proc.stderr.on('data', (d) => stderr += d.toString());
+      proc.on('close', (code) => {
+        if (code !== 0) {
+          resolve({ error: stderr || 'EDGE_TTS_ERROR' });
+          return;
+        }
+        try {
+          resolve(JSON.parse(stdout));
+        } catch (e) {
+          resolve({ error: 'PARSE_ERROR: ' + stdout.slice(0, 200) });
+        }
+      });
+      proc.on('error', (e) => resolve({ error: e.message }));
+    });
+  } catch (e) {
+    return { error: e.message };
+  }
 });
 
 // Get GitHub Token from token.ps1
