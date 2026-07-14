@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://*.google.com https://*.gstatic.com https://*.googletagmanager.com https://*.googleadservices.com https://translate.googleapis.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' https://fonts.gstatic.com https://cdn.jsdelivr.net; frame-src 'self' https://gemini.google.com https://aistudio.google.com; img-src 'self' data: blob: https://*.google.com https://*.googleusercontent.com https://*.gstatic.com https://*.youtube.com https://*.ytimg.com https://*.ggpht.com https://googleads.g.doubleclick.net https://raw.githubusercontent.com; connect-src 'self' https://cdnjs.cloudflare.com https://api.github.com https://*.google.com https://*.googleapis.com https://*.gstatic.com;">
+    content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net https://*.google.com https://*.gstatic.com https://*.googletagmanager.com https://*.googleadservices.com https://translate.googleapis.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' https://fonts.gstatic.com https://cdn.jsdelivr.net; media-src 'self' blob: data:; frame-src 'self' https://gemini.google.com https://aistudio.google.com; img-src 'self' data: blob: https://*.google.com https://*.googleusercontent.com https://*.gstatic.com https://*.youtube.com https://*.ytimg.com https://*.ggpht.com https://googleads.g.doubleclick.net https://raw.githubusercontent.com; connect-src 'self' https://cdnjs.cloudflare.com https://api.github.com https://*.google.com https://*.googleapis.com https://*.gstatic.com;">
   <title>PDF Gemini Reader</title>
   <link rel="stylesheet" href="styles.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -67,6 +67,7 @@
           </button>
         </div>
         <div class="zoom-controls">
+          <button id="ttsToggle" class="btn btn-icon" title="เปลี่ยน TTS Engine" style="font-size:14px;">🔊</button>
           <button id="zoomOut" class="btn btn-icon" title="ซูมออก">➖</button>
           <span id="zoomLevel">100%</span>
           <button id="zoomIn" class="btn btn-icon" title="ซูมเข้า">➕</button>
