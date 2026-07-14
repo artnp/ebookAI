@@ -200,6 +200,7 @@ async function init() {
         await initPDFJS();
         setupEventListeners();
         setupDragAndDrop();
+        setupHandDragScroll();
         await loadReadingHistory();
 
         zoomLevel.textContent = `${Math.round(scale * 100)}%`;
@@ -4510,6 +4511,36 @@ function setupDragAndDrop() {
             } else {
                 await loadPDFFromFile(file);
             }
+        }
+    });
+}
+
+function setupHandDragScroll() {
+    let isDragging = false;
+    let startX, startY, scrollLeft, scrollTop;
+    pdfContainer.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        const t = e.target;
+        if (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'BUTTON' || t.tagName === 'A' || t.tagName === 'SELECT' || t.closest('.highlight-overlay') || t.closest('.context-highlight')) return;
+        isDragging = true;
+        startX = e.clientX;
+        startY = e.clientY;
+        scrollLeft = pdfContainer.scrollLeft;
+        scrollTop = pdfContainer.scrollTop;
+        pdfContainer.style.cursor = 'grabbing';
+        pdfContainer.style.userSelect = 'none';
+    });
+    document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        e.preventDefault();
+        pdfContainer.scrollLeft = scrollLeft - (e.clientX - startX);
+        pdfContainer.scrollTop = scrollTop - (e.clientY - startY);
+    });
+    document.addEventListener('mouseup', () => {
+        if (isDragging) {
+            isDragging = false;
+            pdfContainer.style.cursor = '';
+            pdfContainer.style.userSelect = '';
         }
     });
 }
