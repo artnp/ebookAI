@@ -344,6 +344,23 @@ ipcMain.handle('detect-accounts', async () => {
   return activeIndices;
 });
 
+// Get GitHub Token from token.ps1
+ipcMain.handle('get-github-token', async () => {
+  try {
+    const tokenPath = 'D:\\Github\\token.ps1';
+    if (fs.existsSync(tokenPath)) {
+      const content = fs.readFileSync(tokenPath, 'utf-8');
+      const match = content.match(/\$token\s*=\s*['"]([^'"]+)['"]/);
+      if (match && match[1]) {
+        return match[1].trim();
+      }
+    }
+  } catch (error) {
+    console.error('Error reading Github token from D:\\Github\\token.ps1:', error);
+  }
+  return null;
+});
+
 // Save Application Settings
 ipcMain.handle('save-settings', async (event, data) => {
   try {
