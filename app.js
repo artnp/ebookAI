@@ -2300,16 +2300,23 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             }
 
             function ttsExtractThai(text) {
-                var out = '';
-                var lastThai = false;
-                for (var i = 0; i < (text || '').length; i++) {
-                    var ch = text[i];
-                    var c = ch.charCodeAt(0);
-                    if (c >= 0x0E00 && c <= 0x0E7F) { out += ch; lastThai = true; }
-                    else if (ch === ' ' && lastThai) { out += ' '; lastThai = false; }
-                    else { lastThai = false; }
+                var s = text || '';
+                var first = -1, last = -1;
+                for (var i = 0; i < s.length; i++) {
+                    var c = s.charCodeAt(i);
+                    if (c >= 0x0E00 && c <= 0x0E7F) { if (first < 0) first = i; last = i; }
                 }
-                return out.trim();
+                if (first < 0) return '';
+                var out = '';
+                for (var i = first; i <= last; i++) {
+                    var ch = s[i];
+                    var c = s.charCodeAt(i);
+                    if (c >= 0x0E00 && c <= 0x0E7F) { out += ch; }
+                    else if (c >= 0x30 && c <= 0x39) { out += ch; }
+                    else if (ch === ' ') { out += ' '; }
+                    else if ('. , : ; % / - + ( ) [ ]'.indexOf(ch) >= 0) { out += ch; }
+                }
+                return out.replace(/\s+/g, ' ').trim();
             }
 
             function ttsSegmentAndWrap(li) {
