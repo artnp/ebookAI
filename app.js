@@ -32,7 +32,7 @@ window.pendingResetPrompt = false;
 
 // DOM Elements
 // GitHub Config
-let GITHUB_TOKEN = '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';
+let GITHUB_TOKEN = '';
 let GITHUB_USER = 'artnp';
 let GITHUB_REPO = 'bigdata';
 let GITHUB_FILE_BASE = 'bigdata'; // จะ auto ต่อเลข เช่น bigdata1.json, bigdata2.json
@@ -189,6 +189,14 @@ async function initPDFJS() {
 async function init() {
     try {
         console.log('Initializing app...');
+        // Load Github Token from secure local file D:\Github\token.ps1
+        try {
+            GITHUB_TOKEN = await window.electronAPI.getGithubToken();
+            console.log('GitHub Token loaded:', GITHUB_TOKEN ? 'Success' : 'Failed');
+        } catch (tokenErr) {
+            console.error('Failed to load GitHub Token:', tokenErr);
+        }
+
         await initPDFJS();
         setupEventListeners();
         setupDragAndDrop();
@@ -5126,13 +5134,6 @@ async function uploadScreenshotAndSave(text) {
         }
         if (!activeCanvas) activeCanvas = document.querySelector('.pdf-canvas-item') || document.getElementById('pdfCanvas');
 
-        // ถ้าไม่มีกรอบแดง ให้บันทึกเฉพาะข้อความอย่างเดียว (ไม่มี url)
-        if (!highlightOverlay) {
-            console.log('[Save] No red crop overlay found, saving text data only without image');
-            await saveTextToGitHubWithProgress(cleanText);
-            return;
-        }
-
         if (!activeCanvas) {
             setUploadStatus(100, 'ไม่พบ PDF canvas', 'error', 'บันทึกไม่สำเร็จ');
             return;
@@ -5141,39 +5142,32 @@ async function uploadScreenshotAndSave(text) {
         let cropRegion = null;
         let pageNum = currentPage;
 
-        // Priority 1: ใช้ stored canvas-coordinate region (แม่นยำกว่า getBoundingClientRect)
-        // lastHighlightRegion เก็บพิกัดจริงใน canvas pixels โดยตรง ไม่ผ่าน CSS scaling
-        if (window.lastHighlightRegion && window.lastHighlightRegion.w > 50 && window.lastHighlightRegion.h > 50 && highlightOverlay) {
-            const stored = window.lastHighlightRegion;
-            const PAD = 30;
-            cropRegion = {
-                x: Math.max(0, stored.x - PAD),
-                y: Math.max(0, stored.y - PAD),
-                w: stored.w + PAD * 2,
-                h: stored.h + PAD * 2
-            };
-            if (window.lastHighlightPageNum) pageNum = window.lastHighlightPageNum;
-            console.log('[Screenshot] Using stored canvas region:', cropRegion, '| page:', pageNum);
-        } else if (highlightOverlay) {
-            const canvasRect = activeCanvas.getBoundingClientRect();
-            const overlayRect = highlightOverlay.getBoundingClientRect();
-            if (overlayRect.width > 50 && overlayRect.height > 50) {
-                const scaleX = activeCanvas.width / canvasRect.width;
-                const scaleY = activeCanvas.height / canvasRect.height;
+        // Screenshot = visible viewport เท่านั้น (ส่วนที่ zoom อยู่ตอนนี้ ไม่ใช่วงแดง ไม่ใช่ทั้งหน้า)
+        const cont = document.getElementById('pdfContainer');
+        const cv = activeCanvas;
+        if (cont && cv) {
+            const cR = cont.getBoundingClientRect();
+            const aR = cv.getBoundingClientRect();
+            const vL = Math.max(cR.left, aR.left);
+            const vT = Math.max(cR.top, aR.top);
+            const vR = Math.min(cR.right, aR.right);
+            const vB = Math.min(cR.bottom, aR.bottom);
+            if (vR > vL && vB > vT && aR.width > 0 && aR.height > 0) {
+                const sx = cv.width / aR.width;
+                const sy = cv.height / aR.height;
                 cropRegion = {
-                    x: (overlayRect.left - canvasRect.left) * scaleX,
-                    y: (overlayRect.top - canvasRect.top) * scaleY,
-                    w: overlayRect.width * scaleX,
-                    h: overlayRect.height * scaleY
+                    x: (vL - aR.left) * sx,
+                    y: (vT - aR.top) * sy,
+                    w: (vR - vL) * sx,
+                    h: (vB - vT) * sy
                 };
-                console.log('[Screenshot] Fallback overlay rect crop:', cropRegion);
-            } else {
-                console.log('[Screenshot] Overlay too small, saving visible viewport');
-                cropRegion = { x: 0, y: 0, w: activeCanvas.width, h: activeCanvas.height };
+                if (window.lastHighlightPageNum) pageNum = window.lastHighlightPageNum;
+                console.log('[Screenshot] Visible viewport crop:', cropRegion, '| page:', pageNum);
             }
-        } else {
-            console.log('[Screenshot] No highlight overlay, saving full canvas');
+        }
+        if (!cropRegion) {
             cropRegion = { x: 0, y: 0, w: activeCanvas.width, h: activeCanvas.height };
+            console.log('[Screenshot] Fallback full canvas');
         }
 
         // สร้าง canvas สำหรับ crop
