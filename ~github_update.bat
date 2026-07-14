@@ -17,4 +17,5 @@ if %ERRORLEVEL% equ 0 (
     echo Upload had errors.
 )
 echo.
+pause
 exit /b
