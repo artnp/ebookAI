@@ -14,6 +14,8 @@
   },
   "dependencies": {
     "@cliqz/adblocker-electron": "^1.34.0",
+    "@travisvn/edge-tts": "^1.0.2",
+    "edge-tts": "^1.0.1",
     "node-fetch": "^2.7.0",
     "pdfjs-dist": "^4.0.379"
   }
