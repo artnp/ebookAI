@@ -16,6 +16,7 @@ def check_dependencies():
         sys.exit(1)
 
 def convert_epub_to_pdf(epub_path, pdf_path=None):
+    import ebooklib
     from ebooklib import epub
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image as RLImage, KeepTogether
@@ -46,7 +47,7 @@ def convert_epub_to_pdf(epub_path, pdf_path=None):
     # Extract images from the epub
     image_map = {}
     for item in book.get_items():
-        if item.get_type() == epub.ITEM_IMAGE:
+        if item.get_type() == ebooklib.ITEM_IMAGE:
             name = item.get_name()
             data = item.get_content()
             image_map[name] = data
@@ -58,7 +59,7 @@ def convert_epub_to_pdf(epub_path, pdf_path=None):
     page_width = A4[0] - 30*mm  # usable width
 
     for item in book.get_items():
-        if item.get_type() == epub.ITEM_DOCUMENT:
+        if item.get_type() == ebooklib.ITEM_DOCUMENT:
             content = item.get_body_content().decode('utf-8', errors='replace')
             soup = BeautifulSoup(content, 'html.parser')
 
