@@ -238,25 +238,25 @@ ipcMain.handle('convert-epub', async (event, epubPath) => {
   try {
     const pythonScript = path.join(__dirname, 'convertepub2pdf.py');
     const epubName = path.basename(epubPath).replace(/\.epub$/i, '');
-    const uploadsDir = path.join(__dirname, '.uploads');
-    if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
-    const pdfPath = path.join(uploadsDir, `${epubName}.pdf`);
+    const pdfPath = path.join(path.dirname(epubPath), `${epubName}.pdf`);
 
     return new Promise((resolve) => {
       exec(`python "${pythonScript}" "${epubPath}" "${pdfPath}"`, {
-        timeout: 120000
+        timeout: 300000
       }, (error, stdout, stderr) => {
         if (error) {
           console.error('[EPUB] Convert error:', error.message);
-          resolve(null);
+          if (stderr) console.error('[EPUB] Convert stderr:', stderr);
+          resolve({ error: `แปลงไม่สำเร็จ: ${error.message}${stderr ? ' - ' + stderr.trim().split('\n').pop() : ''}` });
           return;
         }
         console.log('[EPUB] Convert stdout:', stdout);
         if (stderr) console.error('[EPUB] Convert stderr:', stderr);
         if (fs.existsSync(pdfPath)) {
-          resolve(pdfPath);
+          try { fs.unlinkSync(epubPath); } catch (e) { console.error('[EPUB] Delete original failed:', e); }
+          resolve({ path: pdfPath });
         } else {
-          resolve(null);
+          resolve({ error: 'ไม่พบไฟล์ PDF หลังจากแปลง' });
         }
       });
     });
