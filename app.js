@@ -208,12 +208,22 @@ async function init() {
         const args = await window.electronAPI.getArgs();
         for (let i = 1; i < args.length; i++) {
             const arg = args[i];
-            if (arg && typeof arg === 'string' && arg.toLowerCase().endsWith('.pdf')) {
-                const fileExists = await window.electronAPI.checkFileExists(arg);
-                if (fileExists) {
-                    const fileData = await window.electronAPI.openFileDirect(arg);
-                    if (fileData) await loadPDF(fileData);
-                    break;
+            if (arg && typeof arg === 'string') {
+                const lower = arg.toLowerCase();
+                if (lower.endsWith('.pdf')) {
+                    const fileExists = await window.electronAPI.checkFileExists(arg);
+                    if (fileExists) {
+                        const fileData = await window.electronAPI.openFileDirect(arg);
+                        if (fileData) await loadPDF(fileData);
+                        break;
+                    }
+                } else if (lower.endsWith('.epub')) {
+                    const fileExists = await window.electronAPI.checkFileExists(arg);
+                    if (fileExists) {
+                        const fileData = await window.electronAPI.openFileDirect(arg);
+                        if (fileData) await openEPUB(fileData);
+                        break;
+                    }
                 }
             }
         }
@@ -2821,14 +2831,14 @@ async function openFile() {
 
 async function openEPUB(fileData) {
     showToast('กำลังแปลง EPUB เป็น PDF...', 'info');
-    const pdfPath = await window.electronAPI.convertEpub(fileData.path);
-    if (!pdfPath) {
-        showToast('แปลง EPUB ไม่สำเร็จ', 'error');
+    const result = await window.electronAPI.convertEpub(fileData.path);
+    if (!result || result.error) {
+        showToast(result ? `แปลง EPUB ไม่สำเร็จ: ${result.error}` : 'แปลง EPUB ไม่สำเร็จ', 'error');
         return;
     }
     showToast('แปลง EPUB เสร็จแล้ว กำลังเปิดไฟล์...', 'success');
     // โหลด PDF ที่แปลงแล้ว
-    const pdfFileData = await window.electronAPI.openFileDirect(pdfPath);
+    const pdfFileData = await window.electronAPI.openFileDirect(result.path);
     if (pdfFileData) {
         await loadPDF(pdfFileData);
     } else {
@@ -2896,13 +2906,13 @@ async function loadPDFFromFile(file) {
         // Handle EPUB via drag & drop
         if (file.name && file.name.toLowerCase().endsWith('.epub')) {
             showToast('กำลังแปลง EPUB เป็น PDF...', 'info');
-            const pdfPath = await window.electronAPI.convertEpub(file.path || file.name);
-            if (!pdfPath) {
-                showToast('แปลง EPUB ไม่สำเร็จ', 'error');
+            const result = await window.electronAPI.convertEpub(file.path || file.name);
+            if (!result || result.error) {
+                showToast(result ? `แปลง EPUB ไม่สำเร็จ: ${result.error}` : 'แปลง EPUB ไม่สำเร็จ', 'error');
                 return;
             }
             showToast('แปลง EPUB เสร็จแล้ว กำลังเปิดไฟล์...', 'success');
-            const pdfFileData = await window.electronAPI.openFileDirect(pdfPath);
+            const pdfFileData = await window.electronAPI.openFileDirect(result.path);
             if (pdfFileData) {
                 await loadPDF(pdfFileData);
             } else {
