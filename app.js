@@ -201,11 +201,12 @@ async function init() {
         setupEventListeners();
         setupDragAndDrop();
         setupHandDragScroll();
-        await loadReadingHistory();
+        const validBooks = await loadReadingHistory();
 
         zoomLevel.textContent = `${Math.round(scale * 100)}%`;
 
         const args = await window.electronAPI.getArgs();
+        let fileLoaded = false;
         for (let i = 1; i < args.length; i++) {
             const arg = args[i];
             if (arg && typeof arg === 'string') {
@@ -214,17 +215,26 @@ async function init() {
                     const fileExists = await window.electronAPI.checkFileExists(arg);
                     if (fileExists) {
                         const fileData = await window.electronAPI.openFileDirect(arg);
-                        if (fileData) await loadPDF(fileData);
+                        if (fileData) { await loadPDF(fileData); fileLoaded = true; }
                         break;
                     }
                 } else if (lower.endsWith('.epub')) {
                     const fileExists = await window.electronAPI.checkFileExists(arg);
                     if (fileExists) {
                         const fileData = await window.electronAPI.openFileDirect(arg);
-                        if (fileData) await openEPUB(fileData);
+                        if (fileData) { await openEPUB(fileData); fileLoaded = true; }
                         break;
                     }
                 }
+            }
+        }
+
+        if (!fileLoaded && validBooks.length > 0) {
+            const unfinished = validBooks.filter(([filePath, data]) => data.currentPage < data.totalPages);
+            if (unfinished.length > 0) {
+                const [randomPath] = unfinished[Math.floor(Math.random() * unfinished.length)];
+                const fileData = await window.electronAPI.openFileDirect(randomPath);
+                if (fileData) await loadPDF(fileData);
             }
         }
 
@@ -4701,15 +4711,15 @@ async function loadReadingHistory() {
     try {
         const all = await window.electronAPI.getAllProgress();
         const valid = [];
-        for (const [path, data] of Object.entries(all)) {
-            if (await window.electronAPI.checkFileExists(path)) valid.push([path, data]);
+        for (const [filePath, data] of Object.entries(all)) {
+            if (await window.electronAPI.checkFileExists(filePath)) valid.push([filePath, data]);
         }
         if (valid.length > 0) {
             readingHistory.style.display = 'block';
 
             // Build bookshelf
             bookshelf.innerHTML = '';
-            valid.sort((a, b) => new Date(b[1].lastRead) - new Date(a[1].lastRead)).forEach(([path, data]) => {
+            valid.sort((a, b) => new Date(b[1].lastRead) - new Date(a[1].lastRead)).forEach(([filePath, data]) => {
                 const progress = Math.round((data.currentPage / data.totalPages) * 100);
                 const bookItem = document.createElement('div');
                 bookItem.className = 'book-item';
@@ -4724,7 +4734,7 @@ async function loadReadingHistory() {
                     </div>
                 `;
                 bookItem.onclick = async () => {
-                    const res = await window.electronAPI.openFileDirect(path);
+                    const res = await window.electronAPI.openFileDirect(filePath);
                     if (res) await loadPDF(res);
                 };
                 bookshelf.appendChild(bookItem);
@@ -4732,7 +4742,7 @@ async function loadReadingHistory() {
 
             // Main Screen History (Now displayed as Grid of Cards)
             historyList.innerHTML = '';
-            valid.sort((a, b) => new Date(b[1].lastRead) - new Date(a[1].lastRead)).slice(0, 12).forEach(([path, data]) => {
+            valid.sort((a, b) => new Date(b[1].lastRead) - new Date(a[1].lastRead)).slice(0, 12).forEach(([filePath, data]) => {
                 const progress = Math.round((data.currentPage / data.totalPages) * 100);
                 const bookItem = document.createElement('div');
                 bookItem.className = 'book-item';
@@ -4747,13 +4757,14 @@ async function loadReadingHistory() {
                     </div>
                 `;
                 bookItem.onclick = async () => {
-                    const res = await window.electronAPI.openFileDirect(path);
+                    const res = await window.electronAPI.openFileDirect(filePath);
                     if (res) await loadPDF(res);
                 };
                 historyList.appendChild(bookItem);
             });
         }
-    } catch (e) { }
+        return valid;
+    } catch (e) { return []; }
 }
 
 function toggleLibrary() {
