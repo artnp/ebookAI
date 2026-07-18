@@ -14,7 +14,9 @@ let lastPromptedText = '';
 let debounceTimer = null;
 let isProcessingPage = false;
 let isGeminiResponding = false;
-let batchSize = 10; // จำนวนหน้าที่สรุปต่อครั้ง (default 10)
+let batchSize = 1; // Offline mode and new documents summarize one page at a time by default
+let isOfflineMode = false;
+let offlineDocuments = {}; // Documents explicitly chosen for Offline mode
 let pageTextMap = {}; // Map to store text content of each page for searching
 // pageLayoutBlocks declared below with analyzePageLayout
 let highlightContextRecursion = 0;
@@ -198,6 +200,7 @@ async function init() {
         }
 
         await initPDFJS();
+        await loadAppSettings();
         setupEventListeners();
         setupDragAndDrop();
         setupHandDragScroll();
@@ -246,7 +249,35 @@ async function init() {
 
 // Event Listeners
 function setupEventListeners() {
-    loadAppSettings();
+    const offlineModeToggle = document.getElementById('offlineModeToggle');
+    const offlineModeLabel = document.getElementById('offlineModeLabel');
+    if (offlineModeToggle) {
+        offlineModeToggle.addEventListener('change', () => {
+            isOfflineMode = offlineModeToggle.checked;
+            if (currentFileName) {
+                const key = `document:${currentFileName.toLowerCase()}`;
+                if (isOfflineMode) offlineDocuments[key] = true;
+                else delete offlineDocuments[key];
+            }
+            if (offlineModeLabel) offlineModeLabel.textContent = isOfflineMode ? 'Offline' : 'Online';
+            if (isOfflineMode && batchSizeInput) {
+                batchSize = 1;
+                batchSizeInput.value = 1;
+                if (pdfDoc) updateNavigation();
+            }
+            saveAppSettings();
+            setOfflineModeForWebviews();
+            showToast(isOfflineMode ? 'Offline: จะบันทึก PDF ที่ Desktop' : 'Online: จะบันทึกลง GitHub', 'info');
+            if (isOfflineMode && pdfDoc) {
+                // Start the current page immediately; subsequent pages are triggered after each PDF save.
+                window.offlineAutoSaveTriggered = false;
+                lastPromptedText = '';
+                isProcessingPage = false;
+                isGeminiResponding = false;
+                extractTextBatch(currentPage, currentPage);
+            }
+        });
+    }
     if (libraryBtn) libraryBtn.addEventListener('click', toggleLibrary);
     if (closeLibraryBtn) closeLibraryBtn.addEventListener('click', hideLibrary);
     if (addBookBtn) addBookBtn.addEventListener('click', () => { hideLibrary(); openFile(); });
@@ -438,7 +469,8 @@ function setupEventListeners() {
     if (confirmShareBtn) {
         confirmShareBtn.addEventListener('click', () => {
             const text = document.getElementById('shareText').value;
-            uploadScreenshotAndSave(text);
+            if (isOfflineMode) enqueueSaveTask(() => saveOfflineSummary(text));
+            else uploadScreenshotAndSave(text);
             shareModal.classList.remove('show');
             setTimeout(() => shareModal.style.visibility = 'hidden', 200);
         });
@@ -448,6 +480,7 @@ function setupEventListeners() {
         let injectTimer = null;
         webview.addEventListener('dom-ready', () => {
             const isPrefetch = isPrefetchGetter();
+            webview.executeJavaScript(`window.__ebookOfflineMode = ${isOfflineMode ? 'true' : 'false'};`).catch(() => {});
             console.log(`Gemini webview dom-ready (isPrefetch: ${isPrefetch})`);
             if (!isPrefetch) {
                 if (!window.lastPromptId) {
@@ -479,8 +512,17 @@ function setupEventListeners() {
             const msg = e.message;
             const isPrefetch = isPrefetchGetter();
 
-            if (msg.startsWith('__NEXT_PAGE__')) {
+            if (msg === '__OFFLINE_LAST_LI_WHEEL__') {
+                if (isOfflineMode && pdfDoc && currentPage + batchSize <= totalPages) {
+                    goToPage(currentPage + batchSize);
+                    showToast('เปลี่ยนหน้าถัดไป', 'info');
+                }
+            } else if (msg === '__OFFLINE_SEQUENCE_END__') {
+                window.offlineSequenceEnded = true;
+            } else if (msg.startsWith('__NEXT_PAGE__')) {
                 if (isPrefetch) return;
+                // Offline reading stays on the current page until the user changes it.
+                if (isOfflineMode) return;
                 const parts = msg.split(':');
                 if (parts.length > 1) {
                     const range = parts[1].split('-');
@@ -504,12 +546,24 @@ function setupEventListeners() {
                 } else {
                     isGeminiResponding = false;
                     isProcessingPage = false;
+                    // In Offline mode save the focused first summary automatically. The save
+                    // completion handler advances the document only after the PDF is written.
+                    if (isOfflineMode && pdfDoc && !window.offlineAutoSaveTriggered) {
+                        window.offlineAutoSaveTriggered = true;
+                        window.offlineSequenceActive = true;
+                        window.offlineSequenceEnded = false;
+                        setTimeout(() => autoSaveOfflineCurrentResponse(), 1800);
+                    }
                 }
             } else if (msg.startsWith('__GITHUB_SAVE__:')) {
                 if (isPrefetch) return;
                 const text = msg.substring('__GITHUB_SAVE__:'.length);
                 const cleanText = text.replace(/[*_]/g, '').trim();
                 enqueueSaveTask(async () => {
+                    if (isOfflineMode) {
+                        await saveOfflineSummary(text);
+                        return;
+                    }
                     const saved = await uploadTextAndImageWithBlock(cleanText);
                     if (!saved) {
                         await saveTextToGitHubWithProgress(cleanText);
@@ -528,7 +582,8 @@ function setupEventListeners() {
                     } catch (e) {
                         console.error('Highlight error before capture:', e);
                     }
-                    await uploadScreenshotAndSave(shareText);
+                    if (isOfflineMode) await saveOfflineSummary(shareText);
+                    else await uploadScreenshotAndSave(shareText);
                 });
             } else if (msg.startsWith('__OPEN_URL__:')) {
                 window.electronAPI.openExternal(msg.substring('__OPEN_URL__:'.length));
@@ -630,7 +685,8 @@ function setupEventListeners() {
                     } catch (e) {
                         console.error('Highlight error before capture:', e);
                     }
-                    await uploadScreenshotAndSave(shareText);
+                    if (isOfflineMode) await saveOfflineSummary(shareText);
+                    else await uploadScreenshotAndSave(shareText);
                 });
             }
         });
@@ -1455,6 +1511,15 @@ async function highlightContextInPDF(rawPayload) {
             console.log('[Smart Crop] no verified illustration; using article-context fallback');
         }
 
+        // Preserve the actual image/text target separately from the viewport
+        // overlay used for scrolling and visual focus.
+        window.lastFocusedRegion = {
+            pageNum: bestPageNum,
+            region: { ...expanded },
+            viewportWidth: bestPageViewport.width,
+            viewportHeight: bestPageViewport.height
+        };
+
         // Get wrapper for canvas clamping
         const wrapper = document.getElementById(`page-wrapper-${bestPageNum}`);
         let finalCanvas = wrapper ? wrapper.querySelector('canvas') : null;
@@ -1851,6 +1916,12 @@ async function highlightWithLegacyHeuristic(rawPayload) {
     // เก็บ region แม่นยำ (canvas coords) ไว้ใช้ตอน screenshot crop
     window.lastHighlightPageNum = bestCandidate.pageNum;
     window.lastHighlightRegion = { ...regionToDraw };
+    window.lastFocusedRegion = {
+        pageNum: bestCandidate.pageNum,
+        region: { ...regionToDraw },
+        viewportWidth: canvas.width,
+        viewportHeight: canvas.height
+    };
 
     const overlay = drawContextHighlight(bestCandidate.pageNum, regionToDraw);
     if (overlay) {
@@ -2107,7 +2178,10 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                         var currentItems = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
                         if (currentItems.length === 0) return;
                         var idx = parseInt(container.dataset.focusIndex || '0');
-                        if (e.deltaY > 0) { if (idx < currentItems.length - 1) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx++; updateFocus(idx); } }
+                        if (e.deltaY > 0) {
+                            if (idx < currentItems.length - 1) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx++; updateFocus(idx); }
+                            else if (window.__ebookOfflineMode) { console.log('__OFFLINE_LAST_LI_WHEEL__'); }
+                        }
                         else { if (idx > 0) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx--; updateFocus(idx); } }
                         function updateFocus(idx) { currentItems[idx].classList.add('active-focus'); currentItems[idx].scrollIntoView({ behavior: 'smooth', block: 'center' }); triggerHighlight(currentItems[idx]); container.dataset.focusIndex = idx.toString(); setTimeout(tagThaiKeywords, 50); speakLi(currentItems[idx]); }
                     }, { passive: false });
@@ -2213,10 +2287,11 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
                 function moveToNextLi() {
                     var c = li.closest('message-content, .model-response-text, [data-test-id="model-response"]');
-                    if (!c) { console.log('__NEXT_PAGE__'); return; }
+                    if (!c) { console.log('__OFFLINE_SEQUENCE_END__'); console.log('__NEXT_PAGE__'); return; }
                     var items = Array.from(c.querySelectorAll('li')).filter(function(li) { return li.innerText.trim().length > 5; });
                     var idx = items.indexOf(li);
                     if (idx === -1 || idx >= items.length - 1) {
+                        console.log('__OFFLINE_SEQUENCE_END__');
                         console.log('__NEXT_PAGE__');
                         return;
                     }
@@ -2436,6 +2511,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             }
 
             function speakNatural(li) {
+                if (window.__ebookOfflineMode) return;
                 var fullText = li.innerText || '';
                 var thaiText = ttsExtractThai(fullText);
                 if (!thaiText) return;
@@ -2471,6 +2547,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
             function speakLi(li, waitForReady) {
                 ttsStop();
+                if (window.__ebookOfflineMode) return;
                 if (!li) return;
                 if (waitForReady && window.lastStatus !== 'DONE') {
                     var retries = 0;
@@ -2501,7 +2578,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     return;
                 }
                 var nextIdx = command === 'next' ? idx + 1 : idx - 1;
-                if (nextIdx >= items.length) { console.log('__NEXT_PAGE__'); return; }
+                if (nextIdx >= items.length) { console.log('__OFFLINE_SEQUENCE_END__'); console.log('__NEXT_PAGE__'); return; }
                 if (nextIdx < 0) return;
                 items[idx].classList.remove('active-focus');
                 items[nextIdx].classList.add('active-focus');
@@ -2902,6 +2979,7 @@ async function loadPDF(fileData) {
     try {
         currentFilePath = fileData.path;
         currentFileName = fileData.name;
+        restoreOfflineModeForCurrentDocument();
         fileName.textContent = currentFileName;
         pageTextMap = {}; // ล้างข้อความเก่า
 
@@ -2915,18 +2993,10 @@ async function loadPDF(fileData) {
         totalPagesSpan.textContent = totalPages;
         pageInput.max = totalPages;
 
-        // Auto-adjust batchSize based on totalPages
-        if (totalPages < 200) {
-            batchSize = 10;
-        } else if (totalPages <= 500) {
-            batchSize = 20;
-        } else if (totalPages <= 1000) {
-            batchSize = 30;
-        } else {
-            batchSize = 50;
-        }
+        // Start every document one page at a time; saved progress may restore a user choice below.
+        batchSize = 1;
         if (batchSizeInput) batchSizeInput.value = batchSize;
-        showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า (ตามขนาดหนังสือ)`, 'info');
+        showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า`, 'info');
 
         const savedProgress = await window.electronAPI.loadProgress(currentFilePath);
         currentPage = savedProgress ? savedProgress.currentPage : 1;
@@ -2952,6 +3022,7 @@ async function loadPDFFromFile(file) {
     try {
         currentFileName = file.name;
         currentFilePath = file.path || file.name;
+        restoreOfflineModeForCurrentDocument();
         fileName.textContent = currentFileName;
         pageTextMap = {}; // ล้างข้อความเก่า
 
@@ -2981,18 +3052,9 @@ async function loadPDFFromFile(file) {
         totalPagesSpan.textContent = totalPages;
         pageInput.max = totalPages;
 
-        // Auto-adjust batchSize based on totalPages
-        if (totalPages < 200) {
-            batchSize = 10;
-        } else if (totalPages <= 500) {
-            batchSize = 20;
-        } else if (totalPages <= 1000) {
-            batchSize = 30;
-        } else {
-            batchSize = 50;
-        }
+        batchSize = 1;
         if (batchSizeInput) batchSizeInput.value = batchSize;
-        showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า (ตามขนาดหนังสือ)`, 'info');
+        showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า`, 'info');
 
         const savedProgress = await window.electronAPI.loadProgress(currentFilePath);
         currentPage = savedProgress ? savedProgress.currentPage : 1;
@@ -3843,6 +3905,7 @@ async function renderPage(pageNum) {
 }
 
 async function goToPage(pageNum) {
+    window.offlineAutoSaveTriggered = false;
     if (!pdfDoc) return;
     pageNum = Math.max(1, Math.min(pageNum, totalPages));
     if (pageNum !== currentPage) {
@@ -4229,6 +4292,7 @@ async function saveAppSettings() {
             detectedAccounts,
             currentAccountIndex,
             isAutoRotateAccounts,
+            offlineDocuments,
 
         });
     } catch (e) {
@@ -4250,6 +4314,7 @@ async function loadAppSettings() {
             if (settings.isAutoRotateAccounts !== undefined) {
                 isAutoRotateAccounts = settings.isAutoRotateAccounts;
             }
+            if (settings.offlineDocuments && typeof settings.offlineDocuments === 'object') offlineDocuments = settings.offlineDocuments;
 
         }
 
@@ -4272,6 +4337,9 @@ async function loadAppSettings() {
         if (autoRotateAccountsCheckbox) {
             autoRotateAccountsCheckbox.checked = isAutoRotateAccounts;
         }
+        // App startup always defaults to Online. A document can opt in after it is opened.
+        isOfflineMode = false;
+        updateOfflineModeUi();
     } catch (e) {
         console.error('Error loading app settings:', e);
     }
@@ -4879,12 +4947,113 @@ function showToast(message, type = 'info') {
     }, 3000);
 }
 
+function updateOfflineModeUi() {
+    const offlineModeToggle = document.getElementById('offlineModeToggle');
+    const offlineModeLabel = document.getElementById('offlineModeLabel');
+    if (offlineModeToggle) offlineModeToggle.checked = isOfflineMode;
+    if (offlineModeLabel) offlineModeLabel.textContent = isOfflineMode ? 'Offline' : 'Online';
+}
+
+function restoreOfflineModeForCurrentDocument() {
+    const key = `document:${currentFileName.toLowerCase()}`;
+    isOfflineMode = !!offlineDocuments[key];
+    updateOfflineModeUi();
+    setOfflineModeForWebviews();
+}
+
+function setOfflineModeForWebviews() {
+    [geminiWebview, prefetchWebview].forEach((webview) => {
+        if (!webview) return;
+        webview.executeJavaScript(`window.__ebookOfflineMode = ${isOfflineMode ? 'true' : 'false'}; window.__ebookTtsStop && window.__ebookTtsStop();`).catch(() => {});
+    });
+    if (isOfflineMode) stopActiveTts();
+}
+
 // PDF and Gemini live in different panes.  These controls intentionally keep the
 // PDF wheel for navigating the generated list instead of scrolling the canvas.
 function runGeminiReadingCommand(command) {
     if (!geminiWebview) return;
     geminiWebview.executeJavaScript(`window.__ebookPdfCommand && window.__ebookPdfCommand(${JSON.stringify(command)})`)
         .catch(() => {});
+}
+
+async function autoSaveOfflineCurrentResponse(attempt = 0, requireFreshHighlight = false) {
+    if (!isOfflineMode || !pdfDoc || !geminiWebview) return;
+    const maxWaitAttempts = 14; // about 5 seconds; skip an unmatchable item promptly
+    // Gemini can announce completion while the response DOM is still streaming.
+    // Require a settled response and an attached, enabled Save button first.
+    try {
+        const ready = await geminiWebview.executeJavaScript(`(() => {
+            const container = document.querySelector('.focus-response-container') ||
+                Array.from(document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]')).pop();
+            if (!container || window.lastStatus !== 'DONE') return false;
+            return !!container.querySelector('.li-save-btn:not([disabled])');
+        })()`);
+        if (!ready) {
+            if (attempt < maxWaitAttempts) { setTimeout(() => autoSaveOfflineCurrentResponse(attempt + 1, requireFreshHighlight), 350); return; }
+            skipOfflineLiWithoutSaving();
+            return;
+        }
+    } catch (e) {
+        if (attempt < maxWaitAttempts) { setTimeout(() => autoSaveOfflineCurrentResponse(attempt + 1, requireFreshHighlight), 350); return; }
+    }
+    // triggerHighlight() sends its request across webview/host asynchronously.
+    // Do not click Save until a PDF highlight (the focused image/area) is ready.
+    if ((requireFreshHighlight && !window.lastHighlightPromise) || !document.querySelector('.highlight-overlay')) {
+        if (attempt < maxWaitAttempts) {
+            setTimeout(() => autoSaveOfflineCurrentResponse(attempt + 1, requireFreshHighlight), 350);
+            return;
+        }
+        window.offlineAutoSaveTriggered = false;
+        skipOfflineLiWithoutSaving();
+        return;
+    }
+    if (window.lastHighlightPromise) {
+        let highlightResult = null;
+        try { highlightResult = await window.lastHighlightPromise; } catch (e) { console.warn('Offline auto-save highlight failed:', e); }
+        window.lastHighlightPromise = null;
+        // Smart image matching may return no region, while the text fallback has
+        // already drawn a highlight overlay. In that case capture the closest
+        // matching text viewport instead of skipping the <li>.
+        if ((!highlightResult || !highlightResult.region) && !document.querySelector('.highlight-overlay')) {
+            skipOfflineLiWithoutSaving();
+            return;
+        }
+    }
+    try {
+        // The response DOM is streamed asynchronously. Find its Save button directly
+        // and retry briefly until the injected controls have attached.
+        const clicked = await geminiWebview.executeJavaScript(`(() => {
+            const container = document.querySelector('.focus-response-container') ||
+                Array.from(document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]')).pop();
+            if (!container) return false;
+            const active = container.querySelector('li.active-focus .li-save-btn:not([disabled])');
+            const first = container.querySelector('.li-save-btn:not([disabled])');
+            const button = active || first;
+            if (!button) return false;
+            button.click();
+            return true;
+        })()`);
+        if (clicked) return;
+    } catch (e) {
+        console.warn('Offline auto-save command failed:', e);
+    }
+    if (attempt < 24 && isOfflineMode && pdfDoc) {
+        setTimeout(() => autoSaveOfflineCurrentResponse(attempt + 1, requireFreshHighlight), 350);
+    } else {
+        window.offlineAutoSaveTriggered = false;
+        skipOfflineLiWithoutSaving();
+    }
+}
+
+function skipOfflineLiWithoutSaving() {
+    if (!isOfflineMode || window.offlineSequenceEnded) return;
+    showToast('ตำแหน่งนี้หาไม่เจอ — ข้ามไปสรุปถัดไป', 'warning');
+    window.lastHighlightPromise = null;
+    runGeminiReadingCommand('next');
+    setTimeout(() => {
+        if (!window.offlineSequenceEnded) autoSaveOfflineCurrentResponse(0, true);
+    }, 900);
 }
 
 function stopActiveTts() {
@@ -4962,7 +5131,16 @@ function setupPdfTabControls() {
                 end.x - start.x >= 20;
         }
         if (isCheck) {
-            runGeminiReadingCommand('save');
+            if (isOfflineMode) {
+                if (currentPage + batchSize <= totalPages) {
+                    goToPage(currentPage + batchSize);
+                    showToast('เปลี่ยนหน้าถัดไป', 'info');
+                } else {
+                    showToast('ถึงหน้าสุดท้ายแล้ว', 'info');
+                }
+            } else {
+                runGeminiReadingCommand('save');
+            }
             showPdfSaveMark(e.clientX, e.clientY);
             lastCheckSaveAt = now;
             mouseTrail = [];
@@ -5756,6 +5934,120 @@ async function uploadScreenshotAndSave(text) {
         } else {
             setUploadStatus(100, 'บันทึกภาพหน้าจอไม่สำเร็จ', 'error', 'บันทึกไม่สำเร็จ');
         }
+    }
+}
+
+function offlineEntryKey(text) {
+    // Formatting may change between app versions; it must not create a second PDF record.
+    const source = `${currentFileName.toLowerCase()}|${currentPage}|${text.replace(/[*_]/g, '')}`;
+    let hash = 2166136261;
+    for (let i = 0; i < source.length; i++) hash = Math.imul(hash ^ source.charCodeAt(i), 16777619);
+    return `${currentFilePath}|${currentPage}|${(hash >>> 0).toString(36)}`;
+}
+
+function captureOfflineFocusedViewport() {
+    const container = document.getElementById('pdfContainer');
+    const overlay = document.querySelector('.highlight-overlay');
+    let canvas = document.querySelector('.pdf-canvas-item') || document.getElementById('pdfCanvas');
+    if (overlay) {
+        const wrapper = overlay.closest('[id^="page-wrapper-"]');
+        if (wrapper) canvas = wrapper.querySelector('canvas') || canvas;
+    }
+    if (!container || !canvas) return null;
+
+    // Crop the visible, zoomed viewport rather than exporting the entire PDF page.
+    const viewportRect = container.getBoundingClientRect();
+    const canvasRect = canvas.getBoundingClientRect();
+    const left = Math.max(viewportRect.left, canvasRect.left);
+    const top = Math.max(viewportRect.top, canvasRect.top);
+    const right = Math.min(viewportRect.right, canvasRect.right);
+    const bottom = Math.min(viewportRect.bottom, canvasRect.bottom);
+    if (right <= left || bottom <= top || !canvasRect.width || !canvasRect.height) return null;
+
+    const sourceX = (left - canvasRect.left) * canvas.width / canvasRect.width;
+    const sourceY = (top - canvasRect.top) * canvas.height / canvasRect.height;
+    const sourceW = (right - left) * canvas.width / canvasRect.width;
+    const sourceH = (bottom - top) * canvas.height / canvasRect.height;
+    const maxWidth = 1600;
+    const factor = Math.min(1, maxWidth / sourceW);
+    const output = document.createElement('canvas');
+    output.width = Math.max(1, Math.round(sourceW * factor));
+    output.height = Math.max(1, Math.round(sourceH * factor));
+    const outputContext = output.getContext('2d');
+    outputContext.drawImage(canvas, sourceX, sourceY, sourceW, sourceH, 0, 0, output.width, output.height);
+
+    // The DOM highlight is not part of the PDF canvas bitmap, so reproduce its
+    // red locator in the exported image.
+    const focused = window.lastFocusedRegion;
+    if (focused && focused.region) {
+        const fw = focused.viewportWidth || canvas.width;
+        const fh = focused.viewportHeight || canvas.height;
+        const targetRect = {
+            left: canvasRect.left + focused.region.x * canvasRect.width / fw,
+            top: canvasRect.top + focused.region.y * canvasRect.height / fh,
+            right: canvasRect.left + (focused.region.x + focused.region.w) * canvasRect.width / fw,
+            bottom: canvasRect.top + (focused.region.y + focused.region.h) * canvasRect.height / fh
+        };
+        const clipLeft = Math.max(left, targetRect.left);
+        const clipTop = Math.max(top, targetRect.top);
+        const clipRight = Math.min(right, targetRect.right);
+        const clipBottom = Math.min(bottom, targetRect.bottom);
+        if (clipRight > clipLeft && clipBottom > clipTop) {
+            const ox = (clipLeft - left) * output.width / (right - left);
+            const oy = (clipTop - top) * output.height / (bottom - top);
+            const ow = (clipRight - clipLeft) * output.width / (right - left);
+            const oh = (clipBottom - clipTop) * output.height / (bottom - top);
+            outputContext.save();
+            outputContext.strokeStyle = '#ef2b2d';
+            outputContext.lineWidth = Math.max(4, Math.round(output.width / 260));
+            outputContext.shadowColor = 'rgba(0,0,0,.45)';
+            outputContext.shadowBlur = 5;
+            outputContext.strokeRect(ox, oy, ow, oh);
+            outputContext.restore();
+        }
+    }
+    return output.toDataURL('image/jpeg', 0.88);
+}
+
+async function saveOfflineSummary(text) {
+    // Keep **keyword** markup so the exported PDF can render keywords in orange/bold.
+    const cleanText = text.replace(/\[Image:[^\]]*\]/g, '').trim();
+    if (!cleanText || !currentFilePath) return { ok: false };
+    // The active <li> moves/zooms the PDF asynchronously; wait before capturing its viewport.
+    if (window.lastHighlightPromise) {
+        try { await window.lastHighlightPromise; } catch (e) { console.warn('Offline highlight wait failed:', e); }
+        window.lastHighlightPromise = null;
+    }
+    const focusedImage = captureOfflineFocusedViewport();
+    if (!focusedImage) {
+        setUploadStatus(100, 'ไม่พบบริเวณ PDF ที่กำลังซูม', 'error', 'บันทึกไม่สำเร็จ');
+        return { ok: false };
+    }
+    setUploadStatus(20, 'กำลังบันทึกภาพและข้อความลง PDF…', 'loading', 'Offline PDF');
+    try {
+        const result = await window.electronAPI.saveOfflineSummary({
+            documentKey: `document:${currentFileName.toLowerCase()}`,
+            documentName: currentFileName,
+            entryKey: offlineEntryKey(cleanText),
+            page: currentPage,
+            text: cleanText,
+            imageDataUrl: focusedImage
+        });
+        if (!result || !result.ok) {
+            setUploadStatus(100, (result && result.error) || 'สร้าง PDF ไม่สำเร็จ', 'error', 'บันทึกไม่สำเร็จ');
+            return { ok: false };
+        }
+        setUploadStatus(100, result.duplicate ? 'รายการนี้มีอยู่แล้ว — ไม่บันทึกซ้ำ' : `บันทึกที่ ${result.path}`, 'success', 'Offline PDF สำเร็จ ✓');
+        // The button itself selects the next <li> after its save animation. Wait
+        // for that item's new PDF highlight before saving it; never change pages.
+        if (window.offlineSequenceActive && !window.offlineSequenceEnded) {
+            setTimeout(() => autoSaveOfflineCurrentResponse(0, true), 1400);
+        }
+        return result;
+    } catch (e) {
+        console.error('Offline PDF save failed:', e);
+        setUploadStatus(100, 'สร้าง PDF ไม่สำเร็จ', 'error', 'บันทึกไม่สำเร็จ');
+        return { ok: false };
     }
 }
 
