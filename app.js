@@ -31,6 +31,10 @@ let currentAccountIndex = 0;
 let isAutoRotateAccounts = true;
 const MAX_MALFORMED_SUMMARY_RETRIES = 1;
 let malformedSummaryRetries = 0;
+let isAutoPageAdvancePaused = false;
+let autoPageAdvanceTimer = null;
+let autoPageAdvanceRecoveryTimer = null;
+let isCheckingAutoPageAdvanceRecovery = false;
 window.isSwitchingPage = false;
 window.pendingResetPrompt = false;
 
@@ -375,6 +379,52 @@ function setupEventListeners() {
         goToPage(nextStart);
     }
 
+    function pauseAutoPageAdvance(reason) {
+        isAutoPageAdvancePaused = true;
+        if (autoPageAdvanceTimer) {
+            clearTimeout(autoPageAdvanceTimer);
+            autoPageAdvanceTimer = null;
+        }
+        showToast(`หยุดเปลี่ยนหน้าอัตโนมัติ: ${reason}`, 'warning');
+        if (!autoPageAdvanceRecoveryTimer) {
+            autoPageAdvanceRecoveryTimer = setInterval(() => {
+                void resumeAutoPageAdvanceIfFixed();
+            }, 2500);
+        }
+    }
+
+    async function resumeAutoPageAdvanceIfFixed() {
+        if (!isAutoPageAdvancePaused || isCheckingAutoPageAdvanceRecovery) return;
+        isCheckingAutoPageAdvanceRecovery = true;
+        try {
+            if (!await validateLatestGeminiSummary()) return;
+            isAutoPageAdvancePaused = false;
+            malformedSummaryRetries = 0;
+            if (autoPageAdvanceRecoveryTimer) {
+                clearInterval(autoPageAdvanceRecoveryTimer);
+                autoPageAdvanceRecoveryTimer = null;
+            }
+            showToast('พบรายการ <li> ที่ถูกต้องแล้ว เริ่มเปลี่ยนหน้าอัตโนมัติต่อ', 'success');
+            scheduleAutoNextPageBatch();
+        } finally {
+            isCheckingAutoPageAdvanceRecovery = false;
+        }
+    }
+
+    function scheduleAutoNextPageBatch() {
+        if (isOfflineMode || isAutoPageAdvancePaused || window.isSwitchingPage) return;
+        if (autoPageAdvanceTimer) clearTimeout(autoPageAdvanceTimer);
+        autoPageAdvanceTimer = setTimeout(() => {
+            autoPageAdvanceTimer = null;
+            if (!isAutoPageAdvancePaused && !isOfflineMode) triggerNextPageBatch();
+        }, 1200);
+    }
+
+    // Expose these for the Gemini webview console-message handler below.
+    window.pauseAutoPageAdvance = pauseAutoPageAdvance;
+    window.scheduleAutoNextPageBatch = scheduleAutoNextPageBatch;
+    window.resumeAutoPageAdvanceIfFixed = resumeAutoPageAdvanceIfFixed;
+
     if (manualNextPageBtn) manualNextPageBtn.addEventListener('click', triggerNextPageBatch);
     if (bottomNextPageBtn) {
         bottomNextPageBtn.addEventListener('click', () => {
@@ -524,6 +574,7 @@ function setupEventListeners() {
                 window.offlineSequenceEnded = true;
             } else if (msg.startsWith('__NEXT_PAGE__')) {
                 if (isPrefetch) return;
+                if (isAutoPageAdvancePaused) return;
                 // Offline reading stays on the current page until the user changes it.
                 if (isOfflineMode) return;
                 const parts = msg.split(':');
@@ -547,13 +598,24 @@ function setupEventListeners() {
                     isPrefetchResponding = false;
                     isPrefetchReady = true;
                 } else {
+                    // Ignore Gemini's idle/DONE state from the previous chat. A completion
+                    // is actionable only after this page's prompt was actually submitted.
+                    if (!window.geminiRequestSent) return;
+                    window.geminiRequestSent = false;
                     void (async () => {
                     // Gemini can signal completion just before its final DOM update.
                     // Validate before the reader or offline saver consumes this response.
+                    if (await isGeminiAuthenticationRequired()) {
+                        window.pauseAutoPageAdvance('Gemini ต้องการยืนยันตัวตน');
+                        isGeminiResponding = false;
+                        isProcessingPage = false;
+                        return;
+                    }
                     const responseIsStructured = await validateLatestGeminiSummary();
                     if (!responseIsStructured) {
                         const retried = await retryMalformedGeminiSummary();
                         if (retried) return;
+                        window.pauseAutoPageAdvance('Gemini ยังไม่แสดงรายการ <li> ที่ถูกต้อง');
                         isGeminiResponding = false;
                         isProcessingPage = false;
                         return;
@@ -562,6 +624,7 @@ function setupEventListeners() {
                     }
                     isGeminiResponding = false;
                     isProcessingPage = false;
+                    if (!isOfflineMode) window.scheduleAutoNextPageBatch();
                     // In Offline mode save the focused first summary automatically. The save
                     // completion handler advances the document only after the PDF is written.
                     if (isOfflineMode && pdfDoc && !window.offlineAutoSaveTriggered) {
@@ -572,6 +635,11 @@ function setupEventListeners() {
                     }
                     })();
                 }
+            } else if (msg === '__GEMINI_VALID_LI__') {
+                if (isPrefetch || !isAutoPageAdvancePaused) return;
+                // The user repaired/regenerated the response. Resume only after the
+                // same structural validation succeeds; authentication pages never pass.
+                void window.resumeAutoPageAdvanceIfFixed();
             } else if (msg.startsWith('__GITHUB_SAVE__:')) {
                 if (isPrefetch) return;
                 const text = msg.substring('__GITHUB_SAVE__:'.length);
@@ -2872,6 +2940,11 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 if (!li.querySelector('.li-save-btn')) {
                     attachSaveBtnToLi(li);
                 }
+                // Lets the host resume automatic page advance only after a paused
+                // response has genuinely regained a list item.
+                if (window.lastStatus === 'DONE' && li.innerText.trim().length > 12) {
+                    console.log('__GEMINI_VALID_LI__');
+                }
             }
 
             function observeResponseContainer(container) {
@@ -4424,6 +4497,9 @@ async function validateLatestGeminiSummary() {
     await new Promise(resolve => setTimeout(resolve, 700));
     try {
         const result = await geminiWebview.executeJavaScript(`(() => {
+            const pageText = document.body ? document.body.innerText.toLowerCase() : '';
+            const needsVerification = /verify (it'?s )?you|verify your identity|ยืนยันตัวตน|ยืนยันว่าเป็นคุณ|ลงชื่อเข้าใช้/.test(pageText);
+            if (needsVerification) return { valid: false, reason: 'authentication-required' };
             const responses = Array.from(document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]'));
             const response = responses[responses.length - 1];
             if (!response) return { valid: false, reason: 'no-response' };
@@ -4447,6 +4523,18 @@ async function validateLatestGeminiSummary() {
         console.warn('Cannot validate Gemini summary format:', error);
         // Preserve the answer if the embedded browser is momentarily unavailable.
         return true;
+    }
+}
+
+async function isGeminiAuthenticationRequired() {
+    try {
+        return await geminiWebview.executeJavaScript(`(() => {
+            const text = document.body ? document.body.innerText.toLowerCase() : '';
+            return /verify (it'?s )?you|verify your identity|ยืนยันตัวตน|ยืนยันว่าเป็นคุณ|ลงชื่อเข้าใช้/.test(text);
+        })()`);
+    } catch (error) {
+        console.warn('Cannot check Gemini authentication state:', error);
+        return false;
     }
 }
 
@@ -4715,6 +4803,7 @@ async function sendToGemini(textToSummarize, startPage, endPage, illustrationIma
     window.lastPromptId = promptId;
     const requestId = `${promptId}:${Date.now()}`;
     window.activeGeminiRequestId = requestId;
+    window.geminiRequestSent = false;
     isGeminiResponding = true;
 
 
@@ -4725,6 +4814,10 @@ async function sendToGemini(textToSummarize, startPage, endPage, illustrationIma
             isGeminiResponding = false;
             isProcessingPage = false;
             window.lastPromptId = '';
+            window.geminiRequestSent = false;
+            if (window.pauseAutoPageAdvance) {
+                window.pauseAutoPageAdvance('Gemini ไม่ส่งสรุป <li> ภายในเวลาที่กำหนด');
+            }
         }
     }, 45000);
 
@@ -4867,8 +4960,14 @@ ${textToSummarize}`;
                 if (result === "WAITING" && sendRetries < 25) {
                     sendRetries++;
                     setTimeout(trySend, 500);
+                } else if (result === "CLICKED") {
+                    window.geminiRequestSent = true;
+                    // Force the injected status watcher to wait for the response that
+                    // follows this send, instead of reusing the old idle DONE state.
+                    geminiWebview.executeJavaScript('window.lastStatus = "WAITING"').catch(() => {});
                 } else if (result !== "CLICKED") {
                     console.log("sendToGemini: send failed after retries:", result);
+                    window.geminiRequestSent = false;
                 }
             });
         };
@@ -4878,6 +4977,7 @@ ${textToSummarize}`;
         clearTimeout(safeTimeout);
         isGeminiResponding = false;
         window.lastPromptId = '';
+        window.geminiRequestSent = false;
         showToast('ส่งข้อมูลสรุปไม่สำเร็จ', 'error');
     }
 }
