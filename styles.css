@@ -860,3 +860,37 @@ input:checked+.toggle-slider:before {
 .next-page-bottom-btn:active {
   transform: translateY(1px);
 }
+
+.offline-mode-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 12px;
+  padding-right: 12px;
+  border-right: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.offline-mode-control input { display: none; }
+.offline-mode-slider {
+  width: 32px;
+  height: 18px;
+  padding: 2px;
+  border-radius: 999px;
+  background: #64748b;
+  transition: background .2s ease;
+}
+.offline-mode-slider::after {
+  content: '';
+  display: block;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform .2s ease;
+}
+.offline-mode-control input:checked + .offline-mode-slider { background: #16a34a; }
+.offline-mode-control input:checked + .offline-mode-slider::after { transform: translateX(14px); }
