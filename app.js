@@ -4933,29 +4933,34 @@ function setupPdfTabControls() {
     pdfContainer.addEventListener('mousemove', (e) => {
         if (!pdfDoc || e.buttons) { mouseTrail = []; return; }
         const now = Date.now();
+        const last = mouseTrail[mouseTrail.length - 1];
+        // A pause means the next motion is a new gesture, not continuation of
+        // ordinary cursor movement that happened before it.
+        if (last && now - last.time > 220) mouseTrail = [];
         mouseTrail.push({ x: e.clientX, y: e.clientY, time: now });
-        mouseTrail = mouseTrail.filter((point) => now - point.time <= 1200);
+        mouseTrail = mouseTrail.filter((point) => now - point.time <= 1500);
         if (mouseTrail.length < 3 || now - lastCheckSaveAt < 650) return;
-
-        const start = mouseTrail[0];
         const end = mouseTrail[mouseTrail.length - 1];
-        // The lowest screen point is the bend of a ✓ (Y grows downward).
-        let bendIndex = 0;
-        for (let i = 1; i < mouseTrail.length; i++) {
-            if (mouseTrail[i].y > mouseTrail[bendIndex].y) bendIndex = i;
+        // Find the best start and lowest bend anywhere in the recent path.  This
+        // tolerates a little cursor movement before the user begins the ✓.
+        let isCheck = false;
+        for (let startIndex = 0; startIndex < mouseTrail.length - 2 && !isCheck; startIndex++) {
+            let bendIndex = startIndex + 1;
+            for (let i = bendIndex + 1; i < mouseTrail.length - 1; i++) {
+                if (mouseTrail[i].y > mouseTrail[bendIndex].y) bendIndex = i;
+            }
+            const start = mouseTrail[startIndex];
+            const bend = mouseTrail[bendIndex];
+            const firstDx = bend.x - start.x;
+            const firstDy = bend.y - start.y;
+            const secondDx = end.x - bend.x;
+            const secondDy = end.y - bend.y;
+            const firstSlope = firstDy / Math.max(firstDx, 1);
+            const secondSlope = -secondDy / Math.max(secondDx, 1);
+            isCheck = firstDx >= 7 && firstDy >= 8 && firstSlope >= 0.16 && firstSlope <= 5 &&
+                secondDx >= 12 && -secondDy >= 10 && secondSlope >= 0.18 && secondSlope <= 6 &&
+                end.x - start.x >= 20;
         }
-        if (bendIndex === 0 || bendIndex === mouseTrail.length - 1) return;
-        const bend = mouseTrail[bendIndex];
-        const firstDx = bend.x - start.x;
-        const firstDy = bend.y - start.y;
-        const secondDx = end.x - bend.x;
-        const secondDy = end.y - bend.y;
-        const firstSlope = firstDy / Math.max(firstDx, 1);
-        const secondSlope = -secondDy / Math.max(secondDx, 1);
-        const isCheck =
-            firstDx >= 8 && firstDy >= 10 && firstSlope >= 0.2 && firstSlope <= 4.5 &&
-            secondDx >= 14 && -secondDy >= 12 && secondSlope >= 0.25 && secondSlope <= 5 &&
-            end.x - start.x >= 24;
         if (isCheck) {
             runGeminiReadingCommand('save');
             showPdfSaveMark(e.clientX, e.clientY);
