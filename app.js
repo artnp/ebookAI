@@ -11,6 +11,7 @@ let currentFileName = '';
 let isAutoSummarize = true;
 let extractedPageText = '';
 let lastPromptedText = '';
+let lastPromptIllustrationImages = [];
 let debounceTimer = null;
 let isProcessingPage = false;
 let isGeminiResponding = false;
@@ -28,6 +29,8 @@ let tesseractReady = false;
 let detectedAccounts = [0];
 let currentAccountIndex = 0;
 let isAutoRotateAccounts = true;
+const MAX_MALFORMED_SUMMARY_RETRIES = 1;
+let malformedSummaryRetries = 0;
 window.isSwitchingPage = false;
 window.pendingResetPrompt = false;
 
@@ -544,6 +547,19 @@ function setupEventListeners() {
                     isPrefetchResponding = false;
                     isPrefetchReady = true;
                 } else {
+                    void (async () => {
+                    // Gemini can signal completion just before its final DOM update.
+                    // Validate before the reader or offline saver consumes this response.
+                    const responseIsStructured = await validateLatestGeminiSummary();
+                    if (!responseIsStructured) {
+                        const retried = await retryMalformedGeminiSummary();
+                        if (retried) return;
+                        isGeminiResponding = false;
+                        isProcessingPage = false;
+                        return;
+                    } else {
+                        malformedSummaryRetries = 0;
+                    }
                     isGeminiResponding = false;
                     isProcessingPage = false;
                     // In Offline mode save the focused first summary automatically. The save
@@ -554,6 +570,7 @@ function setupEventListeners() {
                         window.offlineSequenceEnded = false;
                         setTimeout(() => autoSaveOfflineCurrentResponse(), 1800);
                     }
+                    })();
                 }
             } else if (msg.startsWith('__GITHUB_SAVE__:')) {
                 if (isPrefetch) return;
@@ -4402,6 +4419,88 @@ async function ensurePrefetchAccountLoaded(index) {
     await new Promise(r => setTimeout(r, 1000)); // Extra settle time
 }
 
+async function validateLatestGeminiSummary() {
+    // Gemini may hide Stop slightly before the final streamed list nodes are committed.
+    await new Promise(resolve => setTimeout(resolve, 700));
+    try {
+        const result = await geminiWebview.executeJavaScript(`(() => {
+            const responses = Array.from(document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]'));
+            const response = responses[responses.length - 1];
+            if (!response) return { valid: false, reason: 'no-response' };
+            const items = Array.from(response.querySelectorAll('li'));
+            const usableItems = items.filter(item => item.innerText.trim().length > 12);
+            const hasNestedItems = items.some(item => item.querySelector('li'));
+            const hasLooseBulletText = Array.from(response.querySelectorAll('p, div')).some(el => {
+                const text = el.innerText.trim();
+                return /^[-•*]\\s+/.test(text) && !el.closest('li') && !el.querySelector('li');
+            });
+            return {
+                valid: usableItems.length > 0 && !hasNestedItems && !hasLooseBulletText,
+                itemCount: usableItems.length,
+                hasNestedItems,
+                hasLooseBulletText
+            };
+        })()`);
+        if (!result || !result.valid) console.warn('Gemini summary format is invalid:', result);
+        return !!(result && result.valid);
+    } catch (error) {
+        console.warn('Cannot validate Gemini summary format:', error);
+        // Preserve the answer if the embedded browser is momentarily unavailable.
+        return true;
+    }
+}
+
+async function retryMalformedGeminiSummary() {
+    if (malformedSummaryRetries >= MAX_MALFORMED_SUMMARY_RETRIES || !lastPromptedText.trim()) {
+        showToast('สรุป Gemini ไม่อยู่ในรูปแบบรายการ กรุณาลองสรุปอีกครั้ง', 'warning');
+        return false;
+    }
+
+    malformedSummaryRetries++;
+    const accountPosition = detectedAccounts.indexOf(currentAccountIndex);
+    const nextPosition = accountPosition >= 0 ? (accountPosition + 1) % detectedAccounts.length : 0;
+    currentAccountIndex = detectedAccounts[nextPosition] ?? currentAccountIndex;
+    localStorage.setItem('currentAccountIndex', currentAccountIndex);
+    if (accountSelect) accountSelect.value = currentAccountIndex;
+    saveAppSettings();
+
+    showToast(`รูปแบบสรุปไม่ถูกต้อง กำลังเปลี่ยนเป็นบัญชี ${currentAccountIndex + 1} และสรุปใหม่...`, 'warning');
+    window.lastPromptId = '';
+    await startFreshGeminiChatAndReset();
+    await sendToGemini(lastPromptedText, currentPage, Math.min(currentPage + batchSize - 1, totalPages), lastPromptIllustrationImages, true);
+    return true;
+}
+
+async function startFreshGeminiChatAndReset() {
+    // A retry must not continue in the malformed conversation. Start a fresh chat
+    // first, then perform the same reload/reset action as the Reset button.
+    await ensureAccountLoaded(currentAccountIndex);
+    await injectGeminiScript();
+
+    try {
+        const newChatResult = await geminiWebview.executeJavaScript('window.startNewChat ? window.startNewChat() : "NOT_READY"');
+        if (newChatResult !== 'CLICKED') console.warn('Could not explicitly start a new Gemini chat:', newChatResult);
+    } catch (error) {
+        console.warn('Could not explicitly start a new Gemini chat:', error);
+    }
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    await new Promise(resolve => {
+        let settled = false;
+        const done = () => {
+            if (settled) return;
+            settled = true;
+            geminiWebview.removeEventListener('dom-ready', done);
+            resolve();
+        };
+        geminiWebview.addEventListener('dom-ready', done);
+        geminiWebview.reload();
+        setTimeout(done, 15000);
+    });
+    await new Promise(resolve => setTimeout(resolve, 800));
+    await injectGeminiScript();
+}
+
 async function preSummarizeNextBatch(textToSummarize, startPage, endPage, illustrationImages = []) {
     if (!prefetchWebview) return;
 
@@ -4596,7 +4695,7 @@ ${textToSummarize}`;
     }
 }
 
-async function sendToGemini(textToSummarize, startPage, endPage, illustrationImages = []) {
+async function sendToGemini(textToSummarize, startPage, endPage, illustrationImages = [], isRetry = false) {
     if (!textToSummarize) {
         textToSummarize = extractedPageText;
         startPage = currentPage;
@@ -4604,20 +4703,25 @@ async function sendToGemini(textToSummarize, startPage, endPage, illustrationIma
     }
     if (!textToSummarize || !textToSummarize.trim()) return;
 
+    lastPromptIllustrationImages = Array.isArray(illustrationImages) ? illustrationImages : [];
+
     const promptId = `${startPage}-${endPage}-${textToSummarize.length}`;
+    if (!isRetry) malformedSummaryRetries = 0;
     // Absolute dedup: same promptId = block until goToPage resets it
-    if (window.lastPromptId === promptId) {
+    if (!isRetry && window.lastPromptId === promptId) {
         console.log(`sendToGemini: duplicate blocked (${promptId})`);
         return;
     }
     window.lastPromptId = promptId;
+    const requestId = `${promptId}:${Date.now()}`;
+    window.activeGeminiRequestId = requestId;
     isGeminiResponding = true;
 
 
 
     // Safety timeout to unlock if Gemini hangs
     const safeTimeout = setTimeout(() => {
-        if (window.lastPromptId === promptId) {
+        if (window.activeGeminiRequestId === requestId) {
             isGeminiResponding = false;
             isProcessingPage = false;
             window.lastPromptId = '';
