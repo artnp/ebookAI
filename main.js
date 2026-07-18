@@ -9,6 +9,74 @@ let mainWindow;
 // Storage path for reading progress
 const progressFilePath = path.join(app.getPath('userData'), 'reading-progress.json');
 const settingsFilePath = path.join(app.getPath('userData'), 'app-settings.json');
+const offlineSummaryFilePath = path.join(app.getPath('userData'), 'offline-summaries.json');
+
+function escapeHtml(value) {
+  return String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function safeSummaryName(name) {
+  return String(name || 'เอกสาร').replace(/\.(pdf|epub)$/i, '').replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim().slice(0, 120) || 'เอกสาร';
+}
+
+function readOfflineSummaries() {
+  try { return fs.existsSync(offlineSummaryFilePath) ? JSON.parse(fs.readFileSync(offlineSummaryFilePath, 'utf8')) : {}; }
+  catch (e) { console.error('Cannot read offline summaries:', e); return {}; }
+}
+
+function formatSummaryHtml(text) {
+  // The renderer marks important words with **word**. Preserve only that small,
+  // intentional markup after escaping all user/model HTML.
+  return escapeHtml(text).replace(/\*\*([^*\n]+)\*\*/g, (match, keyword) => {
+    // Export Thai keyword only; the parenthesized English search anchor is useful
+    // in the reader but should not appear in the PDF summary.
+    const thaiKeyword = keyword.replace(/\s*\([^)]*\)\s*/g, ' ').trim();
+    return `<strong class="keyword">${thaiKeyword}</strong>`;
+  }).replace(/\n/g, '<br>');
+}
+
+function removeOfflineMemoryForPath(filePath) {
+  try {
+    const summaries = readOfflineSummaries();
+    const baseName = path.basename(filePath || '').replace(/\.(pdf|epub)$/i, '').toLowerCase();
+    let changed = false;
+    for (const key of Object.keys(summaries)) {
+      const name = String(summaries[key].documentName || '').replace(/\.(pdf|epub)$/i, '').toLowerCase();
+      if (name === baseName || key.toLowerCase().includes(baseName)) { delete summaries[key]; changed = true; }
+    }
+    if (changed) fs.writeFileSync(offlineSummaryFilePath, JSON.stringify(summaries, null, 2), 'utf8');
+  } catch (e) { console.error('Cannot remove offline memory:', e); }
+}
+
+async function writeOfflinePdf(book) {
+  const desktopPdf = path.join(app.getPath('desktop'), `สรุป_${safeSummaryName(book.documentName)}.pdf`);
+  const entries = book.entries || [];
+  const body = entries.map((entry) => `
+    <section class="entry">
+      <h2>หน้า ${escapeHtml(entry.page)}</h2>
+      ${entry.imageDataUrl ? `<img src="${entry.imageDataUrl}" alt="ภาพหน้า ${escapeHtml(entry.page)}">` : ''}
+      <div class="summary">${formatSummaryHtml(entry.text)}</div>
+    </section>`).join('');
+  const html = `<!doctype html><html><head><meta charset="utf-8"><style>
+    @page { size: A4; margin: 16mm; } body { font-family: 'Arial','Tahoma',sans-serif; color:#172033; }
+    h1 { font-size:20px; margin:0 0 5px } .meta { color:#64748b; font-size:10px; margin-bottom:18px }
+    .entry { break-inside: avoid; page-break-inside: avoid; margin:0 0 22px; padding-bottom:16px; border-bottom:1px solid #d9e1ea }
+    h2 { font-size:15px; margin:0 0 10px; color:#1d4ed8 } img { display:block; max-width:100%; max-height:175mm; margin:0 auto 12px; object-fit:contain }
+    .summary { font-size:15px; line-height:1.8; white-space:normal; } .keyword { color:#ea580c; font-weight:700; }
+  </style></head><body><h1>สรุป: ${escapeHtml(book.documentName)}</h1>${body}</body></html>`;
+  const printWindow = new BrowserWindow({ show: false, webPreferences: { sandbox: true } });
+  const htmlPath = path.join(app.getPath('userData'), 'offline-summary-print.html');
+  try {
+    fs.writeFileSync(htmlPath, html, 'utf8');
+    await printWindow.loadFile(htmlPath);
+    const pdf = await printWindow.webContents.printToPDF({ printBackground: true, pageSize: 'A4', margins: { marginType: 'default' } });
+    fs.writeFileSync(desktopPdf, pdf);
+    return desktopPdf;
+  } finally {
+    if (!printWindow.isDestroyed()) printWindow.destroy();
+    try { if (fs.existsSync(htmlPath)) fs.unlinkSync(htmlPath); } catch (e) { console.warn('Cannot remove temporary PDF HTML:', e); }
+  }
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -195,6 +263,8 @@ ipcMain.handle('cleanup-progress', async () => {
       for (const [filePath, data] of Object.entries(progress)) {
         if (fs.existsSync(filePath)) {
           cleanedProgress[filePath] = data;
+        } else {
+          removeOfflineMemoryForPath(filePath);
         }
       }
 
@@ -224,6 +294,7 @@ ipcMain.handle('delete-file', async (event, filePath) => {
   try {
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
+      removeOfflineMemoryForPath(filePath);
       return true;
     }
     return false;
@@ -304,6 +375,42 @@ ipcMain.handle('save-ebook-image-v2', async (event, dataUrl) => {
     console.error('Save image to desktop failed:', e);
     dialog.showErrorBox('Save Image Error', `Failed to save image to Desktop:\n${e.message}`);
     return null;
+  }
+});
+
+// Offline summaries are persisted separately, then the complete PDF is rebuilt.
+// This makes later app sessions append safely without modifying an existing PDF binary.
+ipcMain.handle('save-offline-summary', async (event, data) => {
+  try {
+    if (!data || !data.documentKey || !data.entryKey || !data.text) return { ok: false, error: 'ข้อมูลสรุปไม่ครบ' };
+    const summaries = readOfflineSummaries();
+    // Prefer the stable document name key so reopening through dialog/drag-drop still continues the same PDF.
+    const previousKey = Object.keys(summaries).find(key => summaries[key] && summaries[key].documentName === data.documentName);
+    const book = summaries[data.documentKey] || (previousKey ? summaries[previousKey] : null) || { documentName: data.documentName || 'เอกสาร', entries: [] };
+    if (previousKey && previousKey !== data.documentKey) delete summaries[previousKey];
+    book.documentName = data.documentName || book.documentName;
+    const existingPdfPath = path.join(app.getPath('desktop'), `สรุป_${safeSummaryName(book.documentName)}.pdf`);
+    // A deleted summary PDF starts a new output; never resurrect old entries into it.
+    if (!fs.existsSync(existingPdfPath)) book.entries = [];
+    const existingEntry = book.entries.find(entry => entry.entryKey === data.entryKey);
+    if (existingEntry) {
+      // Retry generation too: a previous app shutdown may have happened after the manifest was saved.
+      // Also refresh formatting/image captured by the current app without adding another record.
+      existingEntry.text = data.text;
+      existingEntry.imageDataUrl = data.imageDataUrl || existingEntry.imageDataUrl;
+      summaries[data.documentKey] = book;
+      fs.writeFileSync(offlineSummaryFilePath, JSON.stringify(summaries, null, 2), 'utf8');
+      const filePath = await writeOfflinePdf(book);
+      return { ok: true, duplicate: true, path: filePath };
+    }
+    book.entries.push({ entryKey: data.entryKey, page: data.page || 1, text: data.text, imageDataUrl: data.imageDataUrl || '', savedAt: new Date().toISOString() });
+    summaries[data.documentKey] = book;
+    fs.writeFileSync(offlineSummaryFilePath, JSON.stringify(summaries, null, 2), 'utf8');
+    const filePath = await writeOfflinePdf(book);
+    return { ok: true, duplicate: false, path: filePath };
+  } catch (e) {
+    console.error('Save offline summary error:', e);
+    return { ok: false, error: e.message };
   }
 });
 
