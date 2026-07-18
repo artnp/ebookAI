@@ -349,25 +349,28 @@ ipcMain.handle('edge-tts-speak', async (event, text) => {
   try {
     const voice = 'th-TH-PremwadeeNeural';
     const scriptPath = path.join(__dirname, 'edge_tts_speak.py');
-    return new Promise((resolve) => {
+    // Edge occasionally drops a request; retry transient failures before telling
+    // the reader that TTS failed.
+    const speakOnce = () => new Promise((resolve) => {
       const proc = spawn('python', [scriptPath, text, voice], { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
       let stderr = '';
       proc.stdout.on('data', (d) => stdout += d.toString());
       proc.stderr.on('data', (d) => stderr += d.toString());
       proc.on('close', (code) => {
-        if (code !== 0) {
-          resolve({ error: stderr || 'EDGE_TTS_ERROR' });
-          return;
-        }
-        try {
-          resolve(JSON.parse(stdout));
-        } catch (e) {
-          resolve({ error: 'PARSE_ERROR: ' + stdout.slice(0, 200) });
-        }
+        if (code !== 0) return resolve({ error: stderr || 'EDGE_TTS_ERROR' });
+        try { resolve(JSON.parse(stdout)); }
+        catch (e) { resolve({ error: 'PARSE_ERROR: ' + stdout.slice(0, 200) }); }
       });
       proc.on('error', (e) => resolve({ error: e.message }));
     });
+    let result = { error: 'EDGE_TTS_ERROR' };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      result = await speakOnce();
+      if (result && result.audio) return result;
+      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1)));
+    }
+    return result;
   } catch (e) {
     return { error: e.message };
   }
