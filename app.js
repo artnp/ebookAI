@@ -4913,9 +4913,10 @@ function showPdfSaveMark(x, y) {
 
 function setupPdfTabControls() {
     let wheelLocked = false;
-    // A quick down-right then up-right mouse stroke is treated as a ✓ gesture.
-    // It works anywhere in the PDF pane and avoids requiring a tiny save target.
-    let checkGesture = null;
+    // Keep a short motion trail so the ✓ recognition works whether the stroke is
+    // drawn quickly, slowly, or with many intermediate mouse events.
+    let mouseTrail = [];
+    let lastCheckSaveAt = 0;
     pdfContainer.addEventListener('contextmenu', (e) => {
         if (!pdfDoc) return;
         e.preventDefault();
@@ -4930,30 +4931,36 @@ function setupPdfTabControls() {
         setTimeout(() => { wheelLocked = false; }, 140);
     }, { passive: false });
     pdfContainer.addEventListener('mousemove', (e) => {
-        if (!pdfDoc || e.buttons) { checkGesture = null; return; }
+        if (!pdfDoc || e.buttons) { mouseTrail = []; return; }
         const now = Date.now();
-        if (!checkGesture || now - checkGesture.startedAt > 900) {
-            checkGesture = { startedAt: now, x: e.clientX, y: e.clientY, phase: 0 };
-            return;
+        mouseTrail.push({ x: e.clientX, y: e.clientY, time: now });
+        mouseTrail = mouseTrail.filter((point) => now - point.time <= 1200);
+        if (mouseTrail.length < 3 || now - lastCheckSaveAt < 650) return;
+
+        const start = mouseTrail[0];
+        const end = mouseTrail[mouseTrail.length - 1];
+        // The lowest screen point is the bend of a ✓ (Y grows downward).
+        let bendIndex = 0;
+        for (let i = 1; i < mouseTrail.length; i++) {
+            if (mouseTrail[i].y > mouseTrail[bendIndex].y) bendIndex = i;
         }
-        if (checkGesture.phase === 0) {
-            const dx = e.clientX - checkGesture.x;
-            const dy = e.clientY - checkGesture.y;
-            if (dx >= 10 && dy >= 8) {
-                checkGesture = { startedAt: now, x: e.clientX, y: e.clientY, phase: 1 };
-            } else if (dx < -8 || dy < -8) {
-                checkGesture = { startedAt: now, x: e.clientX, y: e.clientY, phase: 0 };
-            }
-            return;
-        }
-        const dx = e.clientX - checkGesture.x;
-        const dy = e.clientY - checkGesture.y;
-        if (dx >= 16 && dy <= -14) {
+        if (bendIndex === 0 || bendIndex === mouseTrail.length - 1) return;
+        const bend = mouseTrail[bendIndex];
+        const firstDx = bend.x - start.x;
+        const firstDy = bend.y - start.y;
+        const secondDx = end.x - bend.x;
+        const secondDy = end.y - bend.y;
+        const firstSlope = firstDy / Math.max(firstDx, 1);
+        const secondSlope = -secondDy / Math.max(secondDx, 1);
+        const isCheck =
+            firstDx >= 8 && firstDy >= 10 && firstSlope >= 0.2 && firstSlope <= 4.5 &&
+            secondDx >= 14 && -secondDy >= 12 && secondSlope >= 0.25 && secondSlope <= 5 &&
+            end.x - start.x >= 24;
+        if (isCheck) {
             runGeminiReadingCommand('save');
             showPdfSaveMark(e.clientX, e.clientY);
-            checkGesture = null;
-        } else if (dx < -8 || dy > 8) {
-            checkGesture = { startedAt: now, x: e.clientX, y: e.clientY, phase: 0 };
+            lastCheckSaveAt = now;
+            mouseTrail = [];
         }
     });
 }
