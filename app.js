@@ -201,6 +201,7 @@ async function init() {
         setupEventListeners();
         setupDragAndDrop();
         setupHandDragScroll();
+        setupPdfTabControls();
         const validBooks = await loadReadingHistory();
 
         zoomLevel.textContent = `${Math.round(scale * 100)}%`;
@@ -444,6 +445,7 @@ function setupEventListeners() {
     }
 
     function setupWebviewListeners(webview, isPrefetchGetter) {
+        let injectTimer = null;
         webview.addEventListener('dom-ready', () => {
             const isPrefetch = isPrefetchGetter();
             console.log(`Gemini webview dom-ready (isPrefetch: ${isPrefetch})`);
@@ -452,9 +454,18 @@ function setupEventListeners() {
                     isGeminiResponding = false;
                 }
             }
-            webview.executeJavaScript('window.geminiScriptInjected = false;').catch(() => { });
-            // Faster re-injection on load
-            setTimeout(() => injectGeminiScript(webview), 1000);
+        });
+        // Gemini commonly redirects /app to an account-specific URL.  dom-ready
+        // may fire for the short-lived redirect document, where executeJavaScript
+        // produces Electron's harmless but noisy ERR_ABORTED (-3).  Wait for the
+        // final navigation to stop before injecting the reading/TTS helper.
+        webview.addEventListener('did-stop-loading', () => {
+            if (injectTimer) clearTimeout(injectTimer);
+            injectTimer = setTimeout(() => {
+                let url = '';
+                try { url = webview.getURL(); } catch (e) { return; }
+                if (url.startsWith('https://gemini.google.com/')) injectGeminiScript(webview);
+            }, 400);
         });
 
         function base64ToBlob(b64, mime) {
@@ -531,8 +542,10 @@ function setupEventListeners() {
                     window.highlightDebounce = setTimeout(() => highlightContextInPDF(terms), 200);
                 }
             } else if (msg === '__TTS_STOP_EDGE__') {
+                window.edgeTtsGeneration = (window.edgeTtsGeneration || 0) + 1;
                 if (window.__edgeAudio) {
                     window.__edgeAudio.pause();
+                    if (window.__edgeAudio._ebookUrl) URL.revokeObjectURL(window.__edgeAudio._ebookUrl);
                     window.__edgeAudio.remove();
                     window.__edgeAudio = null;
                 }
@@ -549,18 +562,28 @@ function setupEventListeners() {
             } else if (msg.startsWith('__TTS_EDGE__:')) {
                 if (isPrefetch) return;
                 var edgeText = msg.substring('__TTS_EDGE__:'.length);
+                var ttsGeneration = (window.edgeTtsGeneration || 0) + 1;
+                window.edgeTtsGeneration = ttsGeneration;
                 if (!window.__ttsCache) window.__ttsCache = {};
                 function playTTS(audioData, dur) {
-                    if (window.__edgeAudio) { window.__edgeAudio.pause(); window.__edgeAudio.remove(); }
+                    // Ignore a response that arrived after the reader moved to another item/page.
+                    if (ttsGeneration !== window.edgeTtsGeneration) return;
+                    if (window.__edgeAudio) {
+                        window.__edgeAudio.pause();
+                        if (window.__edgeAudio._ebookUrl) URL.revokeObjectURL(window.__edgeAudio._ebookUrl);
+                        window.__edgeAudio.remove();
+                    }
                     try {
                         var audioBlob = base64ToBlob(audioData, 'audio/mpeg');
                         var audioUrl = URL.createObjectURL(audioBlob);
                         window.__edgeAudio = new Audio(audioUrl);
+                        window.__edgeAudio._ebookUrl = audioUrl;
                         window.__edgeAudio.volume = 1;
                         window.__edgeAudio.play().catch(function(e) { console.error('EdgeTTS play error:', e); });
                         webview.executeJavaScript('window.__ttsStart && window.__ttsStart(' + dur + ')');
                         window.__edgeAudio.onended = function() {
                             URL.revokeObjectURL(audioUrl);
+                            if (ttsGeneration !== window.edgeTtsGeneration) return;
                             webview.executeJavaScript('window.__ttsStop && window.__ttsStop()');
                         };
                     } catch(e) {
@@ -571,6 +594,7 @@ function setupEventListeners() {
                 var cached = window.__ttsCache[edgeText];
                 if (cached) { playTTS(cached.audio, cached.duration); return; }
                 window.electronAPI.edgeSpeak(edgeText).then(function(res) {
+                    if (ttsGeneration !== window.edgeTtsGeneration) return;
                     if (res && res.error) {
                         console.error('EdgeTTS error:', res.error);
                         showToast('TTS ล้มเหลว ลองอีกครั้ง', 'error');
@@ -2305,7 +2329,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 });
             }
 
-            // --- TTS (Text-to-Speech) for Thai ---
+            // --- TTS (Thai, English and numbers; parenthesized annotations are skipped) ---
             var ttsState = { queue: [], speakingLi: null, utterance: null };
 
             function ttsStop() {
@@ -2320,23 +2344,15 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             }
 
             function ttsExtractThai(text) {
-                var s = text || '';
-                var first = -1, last = -1;
-                for (var i = 0; i < s.length; i++) {
-                    var c = s.charCodeAt(i);
-                    if (c >= 0x0E00 && c <= 0x0E7F) { if (first < 0) first = i; last = i; }
-                }
-                if (first < 0) return '';
-                var out = '';
-                for (var i = first; i <= last; i++) {
-                    var ch = s[i];
-                    var c = s.charCodeAt(i);
-                    if (c >= 0x0E00 && c <= 0x0E7F) { out += ch; }
-                    else if (c >= 0x30 && c <= 0x39) { out += ch; }
-                    else if (ch === ' ') { out += ' '; }
-                    else if ('. , : ; % / - + ( ) [ ]'.indexOf(ch) >= 0) { out += ch; }
-                }
-                return out.replace(/\s+/g, ' ').trim();
+                // Gemini often puts English hints in parentheses; they are useful
+                // visually but should not interrupt the spoken sentence.
+                // This code is embedded in a template literal, so regex escapes
+                // need a second backslash to reach the Gemini webview intact.
+                var s = (text || '').replace(/\\([^)]*\\)/g, ' ');
+                // Keep Thai, English, ASCII/Thai digits and speech-friendly marks.
+                // Previously this kept only Thai, which also caused numbers to vanish.
+                return s.replace(/[^\u0E00-\u0E7FA-Za-z0-9\u0E50-\u0E59\\s.,:;%/\\-+!?]/g, ' ')
+                    .replace(/\\s+/g, ' ').trim();
             }
 
             function ttsSegmentAndWrap(li) {
@@ -2469,6 +2485,32 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 }
                 speakNatural(li);
             }
+            // Public bridge for controls in the PDF pane.
+            window.__ebookTtsStop = ttsStop;
+            window.__ebookPdfCommand = function(command) {
+                var container = document.querySelector('message-content.focus-response-container, .model-response-text.focus-response-container, [data-test-id="model-response"].focus-response-container');
+                if (!container) { setupFocusMode(); container = document.querySelector('.focus-response-container'); }
+                if (!container) return;
+                var items = Array.from(container.querySelectorAll('li')).filter(function(li) { return li.innerText.trim().length > 5; });
+                if (!items.length) return;
+                var idx = parseInt(container.dataset.focusIndex || '0');
+                if (idx < 0 || idx >= items.length) idx = Math.max(0, items.findIndex(function(li) { return li.classList.contains('active-focus'); }));
+                if (command === 'save') {
+                    var saveBtn = items[idx].querySelector('.li-save-btn');
+                    if (saveBtn && !saveBtn.disabled) saveBtn.click();
+                    return;
+                }
+                var nextIdx = command === 'next' ? idx + 1 : idx - 1;
+                if (nextIdx >= items.length) { console.log('__NEXT_PAGE__'); return; }
+                if (nextIdx < 0) return;
+                items[idx].classList.remove('active-focus');
+                items[nextIdx].classList.add('active-focus');
+                container.dataset.focusIndex = nextIdx.toString();
+                items[nextIdx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                triggerHighlight(items[nextIdx]);
+                setTimeout(tagThaiKeywords, 50);
+                speakLi(items[nextIdx]);
+            };
             // --- end TTS ---
 
             function attach() {
@@ -3804,6 +3846,9 @@ async function goToPage(pageNum) {
     if (!pdfDoc) return;
     pageNum = Math.max(1, Math.min(pageNum, totalPages));
     if (pageNum !== currentPage) {
+        // The Gemini response is in a separate webview.  Explicitly stop it before
+        // changing batches so a delayed TTS response from the old page cannot play.
+        stopActiveTts();
         currentPage = pageNum;
         isGeminiResponding = false;
         isProcessingPage = false;
@@ -4832,6 +4877,85 @@ function showToast(message, type = 'info') {
     setTimeout(() => {
         toast.className = 'toast';
     }, 3000);
+}
+
+// PDF and Gemini live in different panes.  These controls intentionally keep the
+// PDF wheel for navigating the generated list instead of scrolling the canvas.
+function runGeminiReadingCommand(command) {
+    if (!geminiWebview) return;
+    geminiWebview.executeJavaScript(`window.__ebookPdfCommand && window.__ebookPdfCommand(${JSON.stringify(command)})`)
+        .catch(() => {});
+}
+
+function stopActiveTts() {
+    // Invalidate pending async Edge-TTS requests as well as stopping the audio
+    // already playing in the host window.
+    window.edgeTtsGeneration = (window.edgeTtsGeneration || 0) + 1;
+    if (window.__edgeAudio) {
+        window.__edgeAudio.pause();
+        if (window.__edgeAudio._ebookUrl) URL.revokeObjectURL(window.__edgeAudio._ebookUrl);
+        window.__edgeAudio.remove();
+        window.__edgeAudio = null;
+    }
+    if (geminiWebview) geminiWebview.executeJavaScript('window.__ebookTtsStop && window.__ebookTtsStop()').catch(() => {});
+}
+
+function showPdfSaveMark(x, y) {
+    const mark = document.createElement('span');
+    mark.textContent = '✓';
+    mark.setAttribute('aria-hidden', 'true');
+    mark.style.cssText = 'position:fixed;z-index:10000;pointer-events:none;color:#22c55e;font-size:26px;font-weight:800;text-shadow:0 1px 4px #000;left:' + x + 'px;top:' + y + 'px;transform:translate(-50%,-50%) scale(.7);opacity:0;transition:opacity .12s,transform .35s;';
+    document.body.appendChild(mark);
+    requestAnimationFrame(() => { mark.style.opacity = '1'; mark.style.transform = 'translate(-50%,-50%) scale(1)'; });
+    setTimeout(() => { mark.style.opacity = '0'; }, 450);
+    setTimeout(() => mark.remove(), 850);
+}
+
+function setupPdfTabControls() {
+    let wheelLocked = false;
+    // A quick down-right then up-right mouse stroke is treated as a ✓ gesture.
+    // It works anywhere in the PDF pane and avoids requiring a tiny save target.
+    let checkGesture = null;
+    pdfContainer.addEventListener('contextmenu', (e) => {
+        if (!pdfDoc) return;
+        e.preventDefault();
+        runGeminiReadingCommand('save');
+        showPdfSaveMark(e.clientX, e.clientY);
+    });
+    pdfContainer.addEventListener('wheel', (e) => {
+        if (!pdfDoc || wheelLocked || !e.deltaY) return;
+        e.preventDefault();
+        wheelLocked = true;
+        runGeminiReadingCommand(e.deltaY > 0 ? 'next' : 'previous');
+        setTimeout(() => { wheelLocked = false; }, 140);
+    }, { passive: false });
+    pdfContainer.addEventListener('mousemove', (e) => {
+        if (!pdfDoc || e.buttons) { checkGesture = null; return; }
+        const now = Date.now();
+        if (!checkGesture || now - checkGesture.startedAt > 900) {
+            checkGesture = { startedAt: now, x: e.clientX, y: e.clientY, phase: 0 };
+            return;
+        }
+        if (checkGesture.phase === 0) {
+            const dx = e.clientX - checkGesture.x;
+            const dy = e.clientY - checkGesture.y;
+            if (dx >= 10 && dy >= 8) {
+                checkGesture = { startedAt: now, x: e.clientX, y: e.clientY, phase: 1 };
+            } else if (dx < -8 || dy < -8) {
+                checkGesture = { startedAt: now, x: e.clientX, y: e.clientY, phase: 0 };
+            }
+            return;
+        }
+        const dx = e.clientX - checkGesture.x;
+        const dy = e.clientY - checkGesture.y;
+        if (dx >= 16 && dy <= -14) {
+            runGeminiReadingCommand('save');
+            showPdfSaveMark(e.clientX, e.clientY);
+            checkGesture = null;
+        } else if (dx < -8 || dy > 8) {
+            checkGesture = { startedAt: now, x: e.clientX, y: e.clientY, phase: 0 };
+        }
+    });
 }
 
 let uploadStatusTimer = null;
