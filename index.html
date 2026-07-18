@@ -46,11 +46,16 @@
       </div>
 
       <div class="header-right">
+        <label class="offline-mode-control" title="Offline: บันทึกสรุปเป็น PDF ที่ Desktop โดยไม่ส่ง GitHub">
+          <input id="offlineModeToggle" type="checkbox">
+          <span class="offline-mode-slider"></span>
+          <span id="offlineModeLabel">Online</span>
+        </label>
         <div class="batch-size-control"
           style="display: flex; align-items: center; gap: 6px; margin-right: 12px; border-right: 1px solid var(--border-color); padding-right: 12px;">
           <label for="batchSizeInput"
             style="font-size: 12px; color: var(--text-secondary); white-space: nowrap;">สรุปทีละ</label>
-          <input type="number" id="batchSizeInput" value="10" min="1" max="50"
+          <input type="number" id="batchSizeInput" value="1" min="1" max="50"
             style="width: 50px; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--border-color); background: var(--bg-secondary); color: var(--text-primary); text-align: center; font-size: 13px;">
           <span style="font-size: 12px; color: var(--text-secondary);">หน้า</span>
         </div>
