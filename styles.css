@@ -70,9 +70,7 @@ body {
   min-width: 400px;
   background: var(--bg-primary);
   position: relative;
-  /* Context for absolute children */
   overflow: hidden;
-  /* Prevent overlay from showing below */
 }
 
 .app-header {
@@ -214,21 +212,17 @@ body.gemini-full .gemini-panel {
   border-radius: var(--radius-md);
 }
 
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
 .header-left,
 .header-center,
 .header-right {
   display: flex;
   align-items: center;
   gap: 12px;
-}
-
-.gemini-controls {
-  -webkit-app-region: no-drag;
-}
-
-.btn-sm {
-  padding: 4px 10px;
-  font-size: 12px;
 }
 
 .file-name {
@@ -240,22 +234,30 @@ body.gemini-full .gemini-panel {
   white-space: nowrap;
 }
 
+.latest-bigdata-info {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  font-weight: 500;
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 6px;
+  padding: 3px 8px;
+  white-space: nowrap;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  -webkit-app-region: no-drag;
+}
+
 .page-info {
   display: flex;
   align-items: center;
   gap: 8px;
   font-size: 14px;
   color: var(--text-secondary);
-}
-
-#pageInput {
-  width: 50px;
-  padding: 4px;
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  color: white;
-  text-align: center;
 }
 
 .toggle-switch {
@@ -299,34 +301,6 @@ input:checked+.toggle-slider:before {
   transform: translateX(20px);
 }
 
-/* --- PDF VIEWER COMPONENTS --- */
-.welcome-screen {
-  flex: 1;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  text-align: center;
-  padding: 40px;
-}
-
-.welcome-icon {
-  color: var(--accent-primary);
-  margin-bottom: 20px;
-  animation: float 3s ease-in-out infinite;
-}
-
-@keyframes float {
-
-  0%,
-  100% {
-    transform: translateY(0);
-  }
-
-  50% {
-    transform: translateY(-10px);
-  }
-}
-
 .pdf-container {
   flex: 1;
   overflow: auto;
@@ -337,6 +311,7 @@ input:checked+.toggle-slider:before {
   padding: 20px;
   cursor: grab;
 }
+
 .pdf-container:active {
   cursor: grabbing;
 }
@@ -390,31 +365,6 @@ input:checked+.toggle-slider:before {
   top: -20px;
   font-size: 10px;
   color: var(--text-muted);
-}
-
-/* History - List View */
-.history-list {
-  display: flex;
-  flex-direction: column;
-  width: 100%;
-  max-width: 900px;
-  margin: 30px auto 0 auto;
-  gap: 8px;
-}
-
-.history-item {
-  display: none;
-}
-
-/* SHARED (Base) */
-.book-item {
-  cursor: pointer;
-  background: var(--bg-secondary);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  position: relative;
-  overflow: hidden;
-  transition: all 0.2s ease;
 }
 
 /* LIST VIEW (Start Screen) */
