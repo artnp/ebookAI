@@ -25,11 +25,7 @@ function readOfflineSummaries() {
 }
 
 function formatSummaryHtml(text) {
-  // The renderer marks important words with **word**. Preserve only that small,
-  // intentional markup after escaping all user/model HTML.
   return escapeHtml(text).replace(/\*\*([^*\n]+)\*\*/g, (match, keyword) => {
-    // Export Thai keyword only; the parenthesized English search anchor is useful
-    // in the reader but should not appear in the PDF summary.
     const thaiKeyword = keyword.replace(/\s*\([^)]*\)\s*/g, ' ').trim();
     return `<strong class="keyword">${thaiKeyword}</strong>`;
   }).replace(/\n/g, '<br>');
@@ -96,16 +92,13 @@ function createWindow() {
     title: 'PDF Gemini Reader'
   });
 
-  // Set a very standard user agent to bypass 'insecure browser' check
   const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
-  // Apply stealth UA to all requests in this session
   session.defaultSession.setUserAgent(chromeUA);
 
   mainWindow.loadFile('index.html');
   mainWindow.maximize();
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    // Only allow specific google login popups if needed, otherwise default deny/allow
     if (url.startsWith('https://accounts.google.com')) {
       return {
         action: 'allow',
@@ -117,8 +110,6 @@ function createWindow() {
       };
     }
 
-    // For all other external links, we want to open them in the default browser (Chrome)
-    // We can deny the internal window and use shell.openExternal
     if (url.startsWith('http')) {
       shell.openExternal(url);
       return { action: 'deny' };
@@ -128,9 +119,7 @@ function createWindow() {
   });
 
   mainWindow.webContents.on('did-attach-webview', (event, webContents) => {
-    // webContents.setUserAgent(chromeUA); // User agent is now set globally for the session
     webContents.setWindowOpenHandler(({ url }) => {
-      // Allow Google login popups to open as native windows
       if (url.startsWith('https://accounts.google.com')) {
         return {
           action: 'allow', overrideBrowserWindowOptions: {
@@ -145,10 +134,7 @@ function createWindow() {
   });
 }
 
-
-// Wait for app ready after all handlers are defined
 console.log('[Main] Registering Lifecycle Events...');
-
 
 // IPC Handlers
 console.log('[Main] Registering IPC handlers...');
@@ -312,23 +298,56 @@ ipcMain.handle('convert-epub', async (event, epubPath) => {
     const pdfPath = path.join(path.dirname(epubPath), `${epubName}.pdf`);
 
     return new Promise((resolve) => {
-      exec(`python "${pythonScript}" "${epubPath}" "${pdfPath}"`, {
-        timeout: 300000
-      }, (error, stdout, stderr) => {
-        if (error) {
-          console.error('[EPUB] Convert error:', error.message);
-          if (stderr) console.error('[EPUB] Convert stderr:', stderr);
-          resolve({ error: `แปลงไม่สำเร็จ: ${error.message}${stderr ? ' - ' + stderr.trim().split('\n').pop() : ''}` });
+      const proc = spawn('python', [pythonScript, epubPath, pdfPath], {
+        env: { ...process.env, PYTHONUNBUFFERED: '1' }
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout.on('data', (data) => {
+        const str = data.toString();
+        stdout += str;
+
+        const lines = str.split(/\r?\n/);
+        for (const line of lines) {
+          const match = line.match(/\[PROGRESS\]\s*(\d+)%(?:\s*-\s*(.*))?/);
+          if (match) {
+            const percent = parseInt(match[1], 10);
+            const detail = match[2] ? match[2].trim() : `กำลังแปลงไฟล์ (${percent}%)`;
+            if (mainWindow && !mainWindow.isDestroyed()) {
+              mainWindow.webContents.send('epub-progress', { percent, detail });
+            }
+          }
+        }
+      });
+
+      proc.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      proc.on('close', (code) => {
+        if (code !== 0) {
+          console.error('[EPUB] Convert error code:', code);
+          console.error('[EPUB] Convert stderr:', stderr);
+          const errDetail = stderr ? stderr.trim().split('\n').pop() : `exit code ${code}`;
+          resolve({ error: `แปลงไม่สำเร็จ: ${errDetail}` });
           return;
         }
         console.log('[EPUB] Convert stdout:', stdout);
         if (stderr) console.error('[EPUB] Convert stderr:', stderr);
+
         if (fs.existsSync(pdfPath)) {
           try { fs.unlinkSync(epubPath); } catch (e) { console.error('[EPUB] Delete original failed:', e); }
           resolve({ path: pdfPath });
         } else {
           resolve({ error: 'ไม่พบไฟล์ PDF หลังจากแปลง' });
         }
+      });
+
+      proc.on('error', (err) => {
+        console.error('[EPUB] Convert spawn error:', err);
+        resolve({ error: `ไม่สามารถเริ่ม process ได้: ${err.message}` });
       });
     });
   } catch (error) {
@@ -364,13 +383,11 @@ ipcMain.handle('save-ebook-image-v2', async (event, dataUrl) => {
     const desktopPath = app.getPath('desktop');
     const filePath = path.join(desktopPath, 'ebookai_line.png');
 
-    // Write the file
     const img = nativeImage.createFromDataURL(dataUrl);
     fs.writeFileSync(filePath, img.toPNG());
 
     console.log('[Main] File saved successfully:', filePath);
     return filePath;
-
   } catch (e) {
     console.error('Save image to desktop failed:', e);
     dialog.showErrorBox('Save Image Error', `Failed to save image to Desktop:\n${e.message}`);
@@ -378,24 +395,19 @@ ipcMain.handle('save-ebook-image-v2', async (event, dataUrl) => {
   }
 });
 
-// Offline summaries are persisted separately, then the complete PDF is rebuilt.
-// This makes later app sessions append safely without modifying an existing PDF binary.
+// Offline summaries are persisted separately
 ipcMain.handle('save-offline-summary', async (event, data) => {
   try {
     if (!data || !data.documentKey || !data.entryKey || !data.text) return { ok: false, error: 'ข้อมูลสรุปไม่ครบ' };
     const summaries = readOfflineSummaries();
-    // Prefer the stable document name key so reopening through dialog/drag-drop still continues the same PDF.
     const previousKey = Object.keys(summaries).find(key => summaries[key] && summaries[key].documentName === data.documentName);
     const book = summaries[data.documentKey] || (previousKey ? summaries[previousKey] : null) || { documentName: data.documentName || 'เอกสาร', entries: [] };
     if (previousKey && previousKey !== data.documentKey) delete summaries[previousKey];
     book.documentName = data.documentName || book.documentName;
     const existingPdfPath = path.join(app.getPath('desktop'), `สรุป_${safeSummaryName(book.documentName)}.pdf`);
-    // A deleted summary PDF starts a new output; never resurrect old entries into it.
     if (!fs.existsSync(existingPdfPath)) book.entries = [];
     const existingEntry = book.entries.find(entry => entry.entryKey === data.entryKey);
     if (existingEntry) {
-      // Retry generation too: a previous app shutdown may have happened after the manifest was saved.
-      // Also refresh formatting/image captured by the current app without adding another record.
       existingEntry.text = data.text;
       existingEntry.imageDataUrl = data.imageDataUrl || existingEntry.imageDataUrl;
       summaries[data.documentKey] = book;
@@ -441,7 +453,7 @@ ipcMain.handle('detect-accounts', async () => {
       if (status === 200 && title.toLowerCase().includes('gemini')) {
         activeIndices.push(i);
       } else {
-        break; // Sequential accounts, stop probing
+        break;
       }
     } catch (error) {
       console.error(`[Main] Error probing account ${i}:`, error);
@@ -456,8 +468,6 @@ ipcMain.handle('edge-tts-speak', async (event, text) => {
   try {
     const voice = 'th-TH-PremwadeeNeural';
     const scriptPath = path.join(__dirname, 'edge_tts_speak.py');
-    // Edge occasionally drops a request; retry transient failures before telling
-    // the reader that TTS failed.
     const speakOnce = () => new Promise((resolve) => {
       const proc = spawn('python', [scriptPath, text, voice], { stdio: ['ignore', 'pipe', 'pipe'] });
       let stdout = '';
@@ -542,5 +552,3 @@ app.whenReady().then(() => {
   console.log('[Main] App ready, creating window...');
   createWindow();
 });
-
-
