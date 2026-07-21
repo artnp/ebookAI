@@ -13,6 +13,11 @@ contextBridge.exposeInMainWorld('electronAPI', {
     cleanupProgress: () => ipcRenderer.invoke('cleanup-progress'),
     getArgs: () => ipcRenderer.invoke('get-args'),
     convertEpub: (path) => ipcRenderer.invoke('convert-epub', path),
+    onEpubProgress: (callback) => {
+        const listener = (_event, data) => callback(data);
+        ipcRenderer.on('epub-progress', listener);
+        return () => ipcRenderer.removeListener('epub-progress', listener);
+    },
     openExternal: (url) => ipcRenderer.invoke('open-external', url),
     deleteFile: (path) => ipcRenderer.invoke('delete-file', path),
     copyToClipboard: (data) => ipcRenderer.invoke('copy-to-clipboard', data),
