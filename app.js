@@ -17,6 +17,13 @@ let isProcessingPage = false;
 let isGeminiResponding = false;
 let batchSize = 1; // Offline mode and new documents summarize one page at a time by default
 let isOfflineMode = false;
+
+function getOnlineBatchSize(pages) {
+    if (!pages || pages <= 0) return 10;
+    if (pages >= 300) return 30;
+    if (pages >= 200) return 20;
+    return 10;
+}
 let offlineDocuments = {}; // Documents explicitly chosen for Offline mode
 let pageTextMap = {}; // Map to store text content of each page for searching
 // pageLayoutBlocks declared below with analyzePageLayout
@@ -47,11 +54,11 @@ let GITHUB_REPO = 'bigdata';
 let GITHUB_FILE_BASE = 'bigdata'; // จะ auto ต่อเลข เช่น bigdata1.json, bigdata2.json
 let GITHUB_FILE = 'bigdata1.json'; // ระบบ auto-rotate ไฟล์ ห้ามแก้เอง // default
 let GITHUB_BRANCH = 'main';
-const GITHUB_MAX_ITEMS = 3000; // สร้างไฟล์ใหม่เมื่อเกิน 3000 รายการ
+const GITHUB_MAX_ITEMS = 2000; // สร้างไฟล์ใหม่เมื่อเกิน 2000 รายการ
 
 // Screenshot Folder Auto-Rotation Config
 let GITHUB_SCREENSHOT_FOLDER_BASE = 'pdf_screenshot';
-let GITHUB_SCREENSHOT_MAX_ITEMS = 3000;
+let GITHUB_SCREENSHOT_MAX_ITEMS = 2000;
 let currentScreenshotFolder = 'pdf_screenshot';
 
 // --- SAVE QUEUE SYSTEM ---
@@ -212,6 +219,8 @@ async function init() {
         setupDragAndDrop();
         setupHandDragScroll();
         setupPdfTabControls();
+        setupAutoMouseFollowScroll();
+        updateLatestBigdataDisplay();
         const validBooks = await loadReadingHistory();
 
         zoomLevel.textContent = `${Math.round(scale * 100)}%`;
@@ -271,6 +280,21 @@ function setupEventListeners() {
                 batchSize = 1;
                 batchSizeInput.value = 1;
                 if (pdfDoc) updateNavigation();
+            } else if (!isOfflineMode && batchSizeInput) {
+                if (pdfDoc) {
+                    window.electronAPI.loadProgress(currentFilePath).then((sp) => {
+                        if (sp && sp.batchSize) {
+                            batchSize = sp.batchSize;
+                        } else {
+                            batchSize = getOnlineBatchSize(totalPages);
+                        }
+                        if (batchSizeInput) batchSizeInput.value = batchSize;
+                        updateNavigation();
+                        renderKeysPages();
+                        extractTextBatch(currentPage, Math.min(currentPage + batchSize - 1, totalPages));
+                        saveProgress();
+                    });
+                }
             }
             saveAppSettings();
             setOfflineModeForWebviews();
@@ -380,44 +404,17 @@ function setupEventListeners() {
     }
 
     function pauseAutoPageAdvance(reason) {
-        isAutoPageAdvancePaused = true;
-        if (autoPageAdvanceTimer) {
-            clearTimeout(autoPageAdvanceTimer);
-            autoPageAdvanceTimer = null;
-        }
-        showToast(`หยุดเปลี่ยนหน้าอัตโนมัติ: ${reason}`, 'warning');
-        if (!autoPageAdvanceRecoveryTimer) {
-            autoPageAdvanceRecoveryTimer = setInterval(() => {
-                void resumeAutoPageAdvanceIfFixed();
-            }, 2500);
-        }
+        // Auto-advance is disabled, so we just log and do nothing (no toast).
+        console.log(`[AutoPageAdvance] Paused: ${reason}`);
     }
 
     async function resumeAutoPageAdvanceIfFixed() {
-        if (!isAutoPageAdvancePaused || isCheckingAutoPageAdvanceRecovery) return;
-        isCheckingAutoPageAdvanceRecovery = true;
-        try {
-            if (!await validateLatestGeminiSummary()) return;
-            isAutoPageAdvancePaused = false;
-            malformedSummaryRetries = 0;
-            if (autoPageAdvanceRecoveryTimer) {
-                clearInterval(autoPageAdvanceRecoveryTimer);
-                autoPageAdvanceRecoveryTimer = null;
-            }
-            showToast('พบรายการ <li> ที่ถูกต้องแล้ว เริ่มเปลี่ยนหน้าอัตโนมัติต่อ', 'success');
-            scheduleAutoNextPageBatch();
-        } finally {
-            isCheckingAutoPageAdvanceRecovery = false;
-        }
+        // Auto-advance is disabled, do nothing.
     }
 
     function scheduleAutoNextPageBatch() {
-        if (isOfflineMode || isAutoPageAdvancePaused || window.isSwitchingPage) return;
-        if (autoPageAdvanceTimer) clearTimeout(autoPageAdvanceTimer);
-        autoPageAdvanceTimer = setTimeout(() => {
-            autoPageAdvanceTimer = null;
-            if (!isAutoPageAdvancePaused && !isOfflineMode) triggerNextPageBatch();
-        }, 1200);
+        // Disabled automatic page advance as requested.
+        return;
     }
 
     // Expose these for the Gemini webview console-message handler below.
@@ -2302,7 +2299,6 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 nextBtn.className = 'gemini-next-page-btn';
                 nextBtn.innerHTML = '<span>หน้าถัดไป &gt;</span>';
                 nextBtn.style.cssText = 'cursor:pointer; background:#2563eb; color:#ffffff; border:none; border-radius:18px; padding:6px 16px; font-size:13px; font-weight:600; margin:4px; display:inline-flex; align-items:center; gap:6px; z-index:9999;';
-                var autoTimer = null;
                 var locked = false;
                 function triggerNext() {
                     if (locked) return;
@@ -2310,14 +2306,6 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     console.log('__NEXT_PAGE__');
                 }
                 nextBtn.onclick = function(e) { e.preventDefault(); e.stopPropagation(); triggerNext(); };
-                nextBtn.addEventListener('mouseenter', function() {
-                    if (locked) return;
-                    autoTimer = setTimeout(function() { triggerNext(); }, 500);
-                });
-                nextBtn.addEventListener('mouseleave', function() {
-                    if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
-                    locked = false;
-                });
                 return nextBtn;
             }
 
@@ -2914,14 +2902,23 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 if (resp.length === 0) return;
                 var c = resp[resp.length - 1];
                 var items = Array.from(c.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
-                if (items.length === 0) { if (autoReadRetries < 20) { autoReadRetries++; setTimeout(autoReadFirstLi, 300); } return; }
+                if (items.length === 0) {
+                    if (autoReadRetries < 30) {
+                        autoReadRetries++;
+                        setTimeout(autoReadFirstLi, 100);
+                    }
+                    return;
+                }
+                if (window.lastStatus !== 'DONE') {
+                    setTimeout(autoReadFirstLi, 100);
+                    return;
+                }
                 autoReadDone = true;
                 autoReadRetries = 0;
-                if (window.lastStatus !== 'DONE') { setTimeout(autoReadFirstLi, 500); return; }
                 items[0].classList.add('active-focus');
                 triggerHighlight(items[0]);
-                setTimeout(function() { items[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 100);
-                setTimeout(function() { speakLi(items[0]); }, 300);
+                setTimeout(function() { items[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 50);
+                setTimeout(function() { speakLi(items[0]); }, 100);
             }
 
             // Init
@@ -3049,13 +3046,14 @@ async function openFile() {
 }
 
 async function openEPUB(fileData) {
-    showToast('กำลังแปลง EPUB เป็น PDF...', 'info');
-    const result = await window.electronAPI.convertEpub(fileData.path);
+    const epubPath = fileData.path || fileData.name;
+    setUploadStatus(0, 'กำลังเริ่มแปลงไฟล์ EPUB...', 'loading', 'กำลังแปลงไฟล์ EPUB เป็น PDF');
+    const result = await window.electronAPI.convertEpub(epubPath);
     if (!result || result.error) {
-        showToast(result ? `แปลง EPUB ไม่สำเร็จ: ${result.error}` : 'แปลง EPUB ไม่สำเร็จ', 'error');
+        setUploadStatus(100, result ? `แปลง EPUB ไม่สำเร็จ: ${result.error}` : 'แปลง EPUB ไม่สำเร็จ', 'error', 'แปลงไฟล์ไม่สำเร็จ');
         return;
     }
-    showToast('แปลง EPUB เสร็จแล้ว กำลังเปิดไฟล์...', 'success');
+    setUploadStatus(100, 'แปลง EPUB เป็น PDF เรียบร้อยแล้ว กำลังเปิดไฟล์...', 'success', 'แปลงไฟล์สำเร็จ ✓');
     // โหลด PDF ที่แปลงแล้ว
     const pdfFileData = await window.electronAPI.openFileDirect(result.path);
     if (pdfFileData) {
@@ -3083,17 +3081,16 @@ async function loadPDF(fileData) {
         totalPagesSpan.textContent = totalPages;
         pageInput.max = totalPages;
 
-        // Start every document one page at a time; saved progress may restore a user choice below.
-        batchSize = 1;
-        if (batchSizeInput) batchSizeInput.value = batchSize;
-        showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า`, 'info');
-
         const savedProgress = await window.electronAPI.loadProgress(currentFilePath);
         currentPage = savedProgress ? savedProgress.currentPage : 1;
         if (savedProgress && savedProgress.batchSize) {
             batchSize = savedProgress.batchSize;
-            if (batchSizeInput) batchSizeInput.value = batchSize;
+        } else {
+            batchSize = isOfflineMode ? 1 : getOnlineBatchSize(totalPages);
         }
+        if (batchSizeInput) batchSizeInput.value = batchSize;
+        showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า`, 'info');
+        await saveProgress();
 
         welcomeScreen.style.display = 'none';
         pdfContainer.style.display = 'flex';
@@ -3118,19 +3115,7 @@ async function loadPDFFromFile(file) {
 
         // Handle EPUB via drag & drop
         if (file.name && file.name.toLowerCase().endsWith('.epub')) {
-            showToast('กำลังแปลง EPUB เป็น PDF...', 'info');
-            const result = await window.electronAPI.convertEpub(file.path || file.name);
-            if (!result || result.error) {
-                showToast(result ? `แปลง EPUB ไม่สำเร็จ: ${result.error}` : 'แปลง EPUB ไม่สำเร็จ', 'error');
-                return;
-            }
-            showToast('แปลง EPUB เสร็จแล้ว กำลังเปิดไฟล์...', 'success');
-            const pdfFileData = await window.electronAPI.openFileDirect(result.path);
-            if (pdfFileData) {
-                await loadPDF(pdfFileData);
-            } else {
-                showToast('ไม่สามารถเปิดไฟล์ PDF ที่แปลงแล้ว', 'error');
-            }
+            await openEPUB({ path: file.path || file.name, name: file.name });
             return;
         }
 
@@ -3142,16 +3127,16 @@ async function loadPDFFromFile(file) {
         totalPagesSpan.textContent = totalPages;
         pageInput.max = totalPages;
 
-        batchSize = 1;
-        if (batchSizeInput) batchSizeInput.value = batchSize;
-        showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า`, 'info');
-
         const savedProgress = await window.electronAPI.loadProgress(currentFilePath);
         currentPage = savedProgress ? savedProgress.currentPage : 1;
         if (savedProgress && savedProgress.batchSize) {
             batchSize = savedProgress.batchSize;
-            if (batchSizeInput) batchSizeInput.value = batchSize;
+        } else {
+            batchSize = isOfflineMode ? 1 : getOnlineBatchSize(totalPages);
         }
+        if (batchSizeInput) batchSizeInput.value = batchSize;
+        showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า`, 'info');
+        await saveProgress();
 
         welcomeScreen.style.display = 'none';
         readingHistory.style.display = 'none'; // Explicitly hide history just in case
@@ -4175,7 +4160,21 @@ async function getGitHubFile(filename, options = null, retries = 3) {
                 if (!options || !options.silent) showToast('ติดต่อ GitHub ไม่ได้ (Status: ' + res.status + ')', 'error');
                 return 'ERR_NET';
             }
-            return await res.json();
+            const data = await res.json();
+            // หากไฟล์มีขนาด > 1MB GitHub Contents API จะไม่คืนค่า content (data.content จะเป็น undefined)
+            if (data && typeof data === 'object' && !data.content && data.download_url) {
+                try {
+                    const rawRes = await fetch(data.download_url, {
+                        headers: { 'Authorization': `token ${GITHUB_TOKEN}` }
+                    });
+                    if (rawRes.ok) {
+                        data.rawContent = await rawRes.text();
+                    }
+                } catch (rawErr) {
+                    console.error('getGitHubFile rawContent fetch error:', rawErr);
+                }
+            }
+            return data;
         } catch (e) {
             if (attempt < retries) {
                 await new Promise(r => setTimeout(r, 1000 * attempt));
@@ -4189,22 +4188,28 @@ async function getGitHubFile(filename, options = null, retries = 3) {
 }
 
 function decodeGitHubContent(fileData) {
-    if (!fileData || !fileData.content) return [];
+    if (!fileData) return [];
     try {
-        let decoded;
-        try {
-            decoded = decodeURIComponent(escape(atob(fileData.content.replace(/\n/g, ''))));
-        } catch (e) {
-            decoded = atob(fileData.content.replace(/\n/g, ''));
+        let decoded = '';
+        if (typeof fileData.rawContent === 'string') {
+            decoded = fileData.rawContent.trim();
+        } else if (typeof fileData.content === 'string') {
+            try {
+                decoded = decodeURIComponent(escape(atob(fileData.content.replace(/\n/g, ''))));
+            } catch (e) {
+                decoded = atob(fileData.content.replace(/\n/g, ''));
+            }
         }
         
+        if (!decoded) return [];
+
         try {
             const sanitized = decoded.replace(/,\s*([\]}])/g, '$1');
             const parsed = JSON.parse(sanitized);
             return Array.isArray(parsed) ? parsed : (typeof parsed === 'object' && parsed ? [parsed] : []);
         } catch (parseError) {
             console.warn('JSON parse failed, trying regex recovery...', parseError);
-            const regex = /\{\s*"data"\s*:\s*"(?:[^"\\]|\\.)*"\s*\}/g;
+            const regex = /\{\s*"data"\s*:\s*"(?:[^"\\]|\\.)*"(?:,\s*"url"\s*:\s*"(?:[^"\\]|\\.)*")?\s*\}/g;
             const matches = decoded.match(regex);
             if (matches) return matches.map(m => { try { return JSON.parse(m); } catch (ex) { return null; } }).filter(x => x);
             return [];
@@ -4221,16 +4226,83 @@ async function findLatestGitHubFile(options = null) {
     while (true) {
         const candidate = GITHUB_FILE_BASE + num + '.json';
         const data = await getGitHubFile(candidate, options);
-        if (!data) break; // ไม่มีไฟล์นี้ → ใช้ไฟล์ล่าสุดที่เจอ
+        if (!data) break; // ไม่มีไฟล์นี้ → ใช้ไฟล์ล่าสุดที่เจอ (สร้างใหม่)
         if (data === 'ERR_AUTH' || data === 'ERR_NET') return null;
         latestFile = candidate;
-        // เช็คว่าไฟล์นี้เต็มยัง
+        
         const items = decodeGitHubContent(data);
-        if (items.length < GITHUB_MAX_ITEMS) break; // ไฟล์นี้ยังไม่เต็ม
-        num++; // ลองไฟล์ถัดไป
+        // หากไฟล์เต็มแล้ว (>= GITHUB_MAX_ITEMS) หรือไฟล์มีขนาด > 0 แต่อ่าน items ไม่ได้ (เกิดจากโครงสร้างผันผวนหรือขนาดใหญ่เกิน) ให้หมุนขึ้นไฟล์ถัดไป
+        const fileHasContent = (data.size && data.size > 0) || (typeof data.rawContent === 'string' && data.rawContent.length > 0) || (typeof data.content === 'string' && data.content.length > 0);
+        if (items.length >= GITHUB_MAX_ITEMS || (fileHasContent && items.length === 0)) {
+            num++; // ลองไฟล์ถัดไป
+            continue;
+        }
+        break; // ไฟล์นี้ยังไม่เต็มและอ่านข้อมูลได้ปกติ
     }
     GITHUB_FILE = latestFile;
     return latestFile;
+}
+
+async function fetchLatestBigdataInfoFromGitHub() {
+    const el = document.getElementById('latestBigdataInfo');
+    if (!el) return;
+
+    try {
+        let num = 1;
+        let lastFileWithItems = null;
+        let lastLineCountWithItems = 0;
+        let firstFile = 'bigdata1.json';
+
+        while (true) {
+            const candidate = `bigdata${num}.json`;
+            const data = await getGitHubFile(candidate, { silent: true });
+            if (!data || data === 'ERR_AUTH' || data === 'ERR_NET') break;
+            
+            const items = decodeGitHubContent(data);
+            if (items && items.length > 0) {
+                lastFileWithItems = candidate;
+                lastLineCountWithItems = items.length + 1;
+            } else if (num === 1) {
+                firstFile = candidate;
+            }
+
+            if (items.length >= GITHUB_MAX_ITEMS) {
+                num++;
+                continue;
+            }
+            break;
+        }
+
+        if (lastFileWithItems && lastLineCountWithItems > 0) {
+            updateLatestBigdataDisplay(lastFileWithItems, lastLineCountWithItems);
+        } else if (firstFile) {
+            updateLatestBigdataDisplay(firstFile, 1);
+        }
+    } catch (err) {
+        console.warn('Failed to fetch latest BigData info from GitHub:', err);
+    }
+}
+
+function updateLatestBigdataDisplay(filename, line) {
+    const el = document.getElementById('latestBigdataInfo');
+    if (!el) return;
+    if (filename && line) {
+        el.textContent = `💾 ${filename} (บรรทัด ${line})`;
+        el.style.display = 'inline-flex';
+        localStorage.setItem('latestBigdataFile', filename);
+        localStorage.setItem('latestBigdataLine', String(line));
+    } else {
+        const savedFile = localStorage.getItem('latestBigdataFile');
+        const savedLine = localStorage.getItem('latestBigdataLine');
+        if (savedFile && savedLine) {
+            el.textContent = `💾 ${savedFile} (บรรทัด ${savedLine})`;
+            el.style.display = 'inline-flex';
+        } else {
+            el.textContent = `💾 bigdata1.json (บรรทัด 1)`;
+            el.style.display = 'inline-flex';
+        }
+        fetchLatestBigdataInfoFromGitHub();
+    }
 }
 
 async function putGitHubFile(filename, contentObj, sha, options = null, retries = 3) {
@@ -4253,15 +4325,17 @@ async function putGitHubFile(filename, contentObj, sha, options = null, retries 
                 body: JSON.stringify(body)
             });
             if (res.ok) {
-                if (!options || !options.silent) showToast('บันทึกที่ ' + filename + ' ✓', 'success');
-                return { ok: true, filename, line: contentObj.length + 1 };
+                const lineNo = contentObj.length + 1;
+                updateLatestBigdataDisplay(filename, lineNo);
+                if (!options || !options.silent) showToast('บันทึกที่ ' + filename + ' (บรรทัด ' + lineNo + ') ✓', 'success');
+                return { ok: true, filename, line: lineNo };
             } else if (res.status === 409) {
                 if (attempt < retries) {
                     const freshData = await getGitHubFile(filename, options);
                     if (freshData && typeof freshData === 'object' && freshData.sha) {
                         sha = freshData.sha;
                         const freshItems = decodeGitHubContent(freshData);
-                        if (freshItems.length < GITHUB_MAX_ITEMS) {
+                        if (freshItems.length > 0 && freshItems.length < GITHUB_MAX_ITEMS) {
                             contentObj = [...freshItems, ...contentObj.slice(-1)];
                         }
                     }
@@ -4316,6 +4390,21 @@ async function updateGitHubFileV2(newContent, url = null, options = null) {
     if (fileData === 'ERR_AUTH' || fileData === 'ERR_NET') return { ok: false };
 
     let items = decodeGitHubContent(fileData);
+
+    // SAFETY GUARD: ป้องกันการลบข้อมูลเดิมออกหมด!
+    // หากไฟล์บน GitHub มีข้อมูลอยู่แล้ว (size > 0 หรือมี sha) แต่ decode ดึงรายการย่อยไม่ได้ 0 รายการ
+    // ห้ามเขียนทับ targetFile เด็ดขาด! ให้หมุนขึ้นไฟล์ใหม่ (bigdata*.json) เพื่อรักษาข้อมูลเดิมไว้
+    const fileHasContent = (fileData.size && fileData.size > 0) || (typeof fileData.rawContent === 'string' && fileData.rawContent.length > 0) || (typeof fileData.content === 'string' && fileData.content.length > 0);
+    if (fileData.sha && fileHasContent && items.length === 0) {
+        console.warn(`[GitHub Save Safety Guard] File ${targetFile} exists on GitHub but decoded 0 items. Auto-rotating to prevent overwriting existing data!`);
+        let num = 2;
+        const match = targetFile.match(/\d+/);
+        if (match) num = parseInt(match[0], 10) + 1;
+        const newTargetFile = GITHUB_FILE_BASE + num + '.json';
+        GITHUB_FILE = newTargetFile;
+        return putGitHubFile(newTargetFile, [newItem], null, options);
+    }
+
     items.push(newItem);
     return putGitHubFile(targetFile, items, fileData.sha, options);
 }
@@ -5111,6 +5200,8 @@ function setupDragAndDrop() {
     });
 }
 
+let lastHandDragTime = 0;
+
 function setupHandDragScroll() {
     let isDragging = false;
     let startX, startY, scrollLeft, scrollTop;
@@ -5125,18 +5216,197 @@ function setupHandDragScroll() {
         scrollTop = pdfContainer.scrollTop;
         pdfContainer.style.cursor = 'grabbing';
         pdfContainer.style.userSelect = 'none';
+        lastHandDragTime = Date.now();
     });
     document.addEventListener('mousemove', (e) => {
         if (!isDragging) return;
         e.preventDefault();
         pdfContainer.scrollLeft = scrollLeft - (e.clientX - startX);
         pdfContainer.scrollTop = scrollTop - (e.clientY - startY);
+        lastHandDragTime = Date.now();
     });
     document.addEventListener('mouseup', () => {
         if (isDragging) {
             isDragging = false;
             pdfContainer.style.cursor = '';
             pdfContainer.style.userSelect = '';
+            lastHandDragTime = Date.now();
+        }
+    });
+}
+
+function setupAutoMouseFollowScroll() {
+    let targetScrollLeft = 0;
+    let targetScrollTop = 0;
+    let autoScrollAnimId = null;
+    let isMouseInsidePdf = false;
+    let lastMouseX = 0;
+    let lastMouseY = 0;
+    let lastMouseMoveTime = 0;
+
+    function smoothMouseFollowScroll() {
+        if (!pdfDoc || !isMouseInsidePdf) return;
+
+        // If user recently hand-dragged, stay where user dragged to!
+        if (Date.now() - lastHandDragTime < 1500) {
+            autoScrollAnimId = requestAnimationFrame(smoothMouseFollowScroll);
+            return;
+        }
+
+        const overlay = document.querySelector('.highlight-overlay');
+        if (!overlay) return;
+
+        const overlayRect = overlay.getBoundingClientRect();
+        const containerRect = pdfContainer.getBoundingClientRect();
+
+        const marginX = overlayRect.width * 0.60;
+        const marginY = overlayRect.height * 0.60;
+
+        const boxLeft = overlayRect.left - containerRect.left + pdfContainer.scrollLeft - marginX;
+        const boxTop = overlayRect.top - containerRect.top + pdfContainer.scrollTop - marginY;
+        const boxWidth = overlayRect.width + 2 * marginX;
+        const boxHeight = overlayRect.height + 2 * marginY;
+
+        const vWidth = pdfContainer.clientWidth;
+        const vHeight = pdfContainer.clientHeight;
+
+        let minLeft, maxLeft, minTop, maxTop;
+
+        if (boxWidth <= vWidth) {
+            minLeft = boxLeft - (vWidth - boxWidth) / 2;
+            maxLeft = minLeft;
+        } else {
+            minLeft = boxLeft;
+            maxLeft = boxLeft + boxWidth - vWidth;
+        }
+
+        if (boxHeight <= vHeight) {
+            minTop = boxTop - (vHeight - boxHeight) / 2;
+            maxTop = minTop;
+        } else {
+            minTop = boxTop;
+            maxTop = boxTop + boxHeight - vHeight;
+        }
+
+        const clampLeft = Math.max(Math.min(minLeft, maxLeft), Math.min(Math.max(minLeft, maxLeft), targetScrollLeft));
+        const clampTop = Math.max(Math.min(minTop, maxTop), Math.min(Math.max(minTop, maxTop), targetScrollTop));
+
+        const diffX = clampLeft - pdfContainer.scrollLeft;
+        if (Math.abs(diffX) > 0.5) {
+            pdfContainer.scrollLeft += diffX * 0.18;
+        }
+
+        const diffY = clampTop - pdfContainer.scrollTop;
+        if (Math.abs(diffY) > 0.5) {
+            pdfContainer.scrollTop += diffY * 0.18;
+        }
+
+        autoScrollAnimId = requestAnimationFrame(smoothMouseFollowScroll);
+    }
+
+    pdfContainer.addEventListener('mousemove', (e) => {
+        if (!pdfDoc || e.buttons !== 0) {
+            isMouseInsidePdf = false;
+            return;
+        }
+
+        if (Date.now() - lastHandDragTime < 1500) {
+            isMouseInsidePdf = false;
+            return;
+        }
+
+        const now = Date.now();
+        const dt = now - lastMouseMoveTime;
+        const dx = e.clientX - lastMouseX;
+        const dy = e.clientY - lastMouseY;
+        lastMouseX = e.clientX;
+        lastMouseY = e.clientY;
+        lastMouseMoveTime = now;
+
+        // Pause auto-follow during fast motion stroke (drawing checkmark gesture)
+        if (dt > 0 && dt < 150) {
+            const speed = Math.hypot(dx, dy) / dt;
+            if (speed > 0.65) {
+                isMouseInsidePdf = false;
+                return;
+            }
+        }
+
+        // Auto follow allows up to 60% margin outside the red box (.highlight-overlay)
+        const overlay = document.querySelector('.highlight-overlay');
+        if (!overlay) {
+            isMouseInsidePdf = false;
+            return;
+        }
+
+        const overlayRect = overlay.getBoundingClientRect();
+        const marginX = overlayRect.width * 0.60;
+        const marginY = overlayRect.height * 0.60;
+
+        const isInsideRedBoxWith60Percent = (
+            e.clientX >= overlayRect.left - marginX &&
+            e.clientX <= overlayRect.right + marginX &&
+            e.clientY >= overlayRect.top - marginY &&
+            e.clientY <= overlayRect.bottom + marginY
+        );
+
+        if (!isInsideRedBoxWith60Percent) {
+            isMouseInsidePdf = false;
+            return;
+        }
+
+        const containerRect = pdfContainer.getBoundingClientRect();
+        if (containerRect.width <= 0 || containerRect.height <= 0) return;
+
+        const boxLeft = overlayRect.left - containerRect.left + pdfContainer.scrollLeft - marginX;
+        const boxTop = overlayRect.top - containerRect.top + pdfContainer.scrollTop - marginY;
+        const boxWidth = overlayRect.width + 2 * marginX;
+        const boxHeight = overlayRect.height + 2 * marginY;
+
+        const vWidth = pdfContainer.clientWidth;
+        const vHeight = pdfContainer.clientHeight;
+
+        let minLeft, maxLeft, minTop, maxTop;
+
+        if (boxWidth <= vWidth) {
+            minLeft = boxLeft - (vWidth - boxWidth) / 2;
+            maxLeft = minLeft;
+        } else {
+            minLeft = boxLeft;
+            maxLeft = boxLeft + boxWidth - vWidth;
+        }
+
+        if (boxHeight <= vHeight) {
+            minTop = boxTop - (vHeight - boxHeight) / 2;
+            maxTop = minTop;
+        } else {
+            minTop = boxTop;
+            maxTop = boxTop + boxHeight - vHeight;
+        }
+
+        const minMouseX = overlayRect.left - marginX;
+        const maxMouseX = overlayRect.right + marginX;
+        const minMouseY = overlayRect.top - marginY;
+        const maxMouseY = overlayRect.bottom + marginY;
+
+        const rx = Math.max(0, Math.min(1, (e.clientX - minMouseX) / Math.max(1, maxMouseX - minMouseX)));
+        const ry = Math.max(0, Math.min(1, (e.clientY - minMouseY) / Math.max(1, maxMouseY - minMouseY)));
+
+        targetScrollLeft = minLeft + rx * (maxLeft - minLeft);
+        targetScrollTop = minTop + ry * (maxTop - minTop);
+
+        if (!isMouseInsidePdf) {
+            isMouseInsidePdf = true;
+            if (autoScrollAnimId) cancelAnimationFrame(autoScrollAnimId);
+            autoScrollAnimId = requestAnimationFrame(smoothMouseFollowScroll);
+        }
+    });
+
+    pdfContainer.addEventListener('mouseleave', () => {
+        isMouseInsidePdf = false;
+        if (autoScrollAnimId) {
+            cancelAnimationFrame(autoScrollAnimId);
+            autoScrollAnimId = null;
         }
     });
 }
@@ -5309,30 +5579,29 @@ function setupPdfTabControls() {
         const last = mouseTrail[mouseTrail.length - 1];
         // A pause means the next motion is a new gesture, not continuation of
         // ordinary cursor movement that happened before it.
-        if (last && now - last.time > 220) mouseTrail = [];
+        if (last && now - last.time > 180) mouseTrail = [];
         mouseTrail.push({ x: e.clientX, y: e.clientY, time: now });
-        mouseTrail = mouseTrail.filter((point) => now - point.time <= 1500);
-        if (mouseTrail.length < 3 || now - lastCheckSaveAt < 650) return;
+        mouseTrail = mouseTrail.filter((point) => now - point.time <= 600);
+        if (mouseTrail.length < 4 || now - lastCheckSaveAt < 650) return;
         const end = mouseTrail[mouseTrail.length - 1];
-        // Find the best start and lowest bend anywhere in the recent path.  This
-        // tolerates a little cursor movement before the user begins the ✓.
         let isCheck = false;
-        for (let startIndex = 0; startIndex < mouseTrail.length - 2 && !isCheck; startIndex++) {
+        for (let startIndex = 0; startIndex < mouseTrail.length - 3 && !isCheck; startIndex++) {
             let bendIndex = startIndex + 1;
             for (let i = bendIndex + 1; i < mouseTrail.length - 1; i++) {
                 if (mouseTrail[i].y > mouseTrail[bendIndex].y) bendIndex = i;
             }
             const start = mouseTrail[startIndex];
             const bend = mouseTrail[bendIndex];
+            const strokeTime = end.time - start.time;
             const firstDx = bend.x - start.x;
             const firstDy = bend.y - start.y;
             const secondDx = end.x - bend.x;
             const secondDy = end.y - bend.y;
             const firstSlope = firstDy / Math.max(firstDx, 1);
             const secondSlope = -secondDy / Math.max(secondDx, 1);
-            isCheck = firstDx >= 7 && firstDy >= 8 && firstSlope >= 0.16 && firstSlope <= 5 &&
-                secondDx >= 12 && -secondDy >= 10 && secondSlope >= 0.18 && secondSlope <= 6 &&
-                end.x - start.x >= 20;
+            isCheck = firstDx >= 12 && firstDy >= 18 && firstSlope >= 0.25 && firstSlope <= 4.5 &&
+                secondDx >= 18 && -secondDy >= 20 && secondSlope >= 0.25 && secondSlope <= 5.0 &&
+                end.x - start.x >= 35 && strokeTime >= 100 && strokeTime <= 600;
         }
         if (isCheck) {
             if (isOfflineMode) {
@@ -5376,6 +5645,20 @@ function setUploadStatus(percent, detail, state = 'loading', title = 'กำล�
             popup.setAttribute('aria-hidden', 'true');
         }, 5500);
     }
+}
+
+// EPUB conversion progress listener
+if (window.electronAPI && typeof window.electronAPI.onEpubProgress === 'function') {
+    window.electronAPI.onEpubProgress((data) => {
+        if (data && typeof data.percent === 'number') {
+            setUploadStatus(
+                data.percent,
+                data.detail || `กำลังแปลง EPUB เป็น PDF (${data.percent}%)`,
+                data.percent >= 100 ? 'success' : 'loading',
+                'กำลังแปลงไฟล์ EPUB เป็น PDF'
+            );
+        }
+    });
 }
 
 function reportUploadProgress(options, percent, detail) {
