@@ -30,7 +30,10 @@ def convert_epub_to_pdf(epub_path, pdf_path=None):
     if pdf_path is None:
         pdf_path = os.path.splitext(epub_path)[0] + '.pdf'
 
+    print("[PROGRESS] 5% - กำลังเปิดอ่านไฟล์ EPUB", flush=True)
     book = epub.read_epub(epub_path)
+    print("[PROGRESS] 15% - อ่านโครงสร้าง EPUB สำเร็จ", flush=True)
+
     doc = SimpleDocTemplate(pdf_path, pagesize=A4,
                             leftMargin=15*mm, rightMargin=15*mm,
                             topMargin=15*mm, bottomMargin=15*mm)
@@ -46,7 +49,8 @@ def convert_epub_to_pdf(epub_path, pdf_path=None):
 
     # Extract images from the epub
     image_map = {}
-    for item in book.get_items():
+    items = list(book.get_items())
+    for item in items:
         if item.get_type() == ebooklib.ITEM_IMAGE:
             name = item.get_name()
             data = item.get_content()
@@ -56,74 +60,85 @@ def convert_epub_to_pdf(epub_path, pdf_path=None):
             if base not in image_map:
                 image_map[base] = data
 
+    print("[PROGRESS] 25% - สกัดรูปภาพใน EPUB เรียบร้อย", flush=True)
+
     page_width = A4[0] - 30*mm  # usable width
 
-    for item in book.get_items():
-        if item.get_type() == ebooklib.ITEM_DOCUMENT:
-            content = item.get_body_content().decode('utf-8', errors='replace')
-            soup = BeautifulSoup(content, 'html.parser')
+    doc_items = [item for item in items if item.get_type() == ebooklib.ITEM_DOCUMENT]
+    total_docs = len(doc_items)
 
-            for element in soup.descendants:
-                if element.name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
-                    text = element.get_text(strip=True)
-                    if text:
-                        story.append(Paragraph(text, heading_style))
+    for idx, item in enumerate(doc_items):
+        pct = int(25 + ((idx + 1) / max(1, total_docs)) * 60)
+        item_name = os.path.basename(item.get_name() or '')
+        detail_msg = f"กำลังแปลงเนื้อหา {item_name} ({idx+1}/{total_docs})" if item_name else f"กำลังแปลงเนื้อหาบทที่ {idx+1}/{total_docs}"
+        print(f"[PROGRESS] {pct}% - {detail_msg}", flush=True)
 
-                elif element.name == 'p':
-                    text = element.get_text(strip=True)
-                    if text:
-                        safe_text = html_module.escape(text)
-                        story.append(Paragraph(safe_text, normal_style))
+        content = item.get_body_content().decode('utf-8', errors='replace')
+        soup = BeautifulSoup(content, 'html.parser')
 
-                elif element.name == 'img':
-                    src = element.get('src', '')
-                    if not src:
-                        continue
-                    img_data = None
-                    img_path = src
-                    # Try to resolve relative paths
-                    if img_path in image_map:
-                        img_data = image_map[img_path]
-                    elif os.path.basename(img_path) in image_map:
-                        img_data = image_map[os.path.basename(img_path)]
-                    else:
-                        # Try matching by longest suffix
-                        matches = [k for k in image_map if img_path.endswith(k) or k.endswith(img_path)]
-                        if matches:
-                            img_data = image_map[matches[0]]
+        for element in soup.descendants:
+            if element.name in ('h1', 'h2', 'h3', 'h4', 'h5', 'h6'):
+                text = element.get_text(strip=True)
+                if text:
+                    story.append(Paragraph(text, heading_style))
 
-                    if img_data:
-                        try:
-                            pil_img = Image.open(io.BytesIO(img_data))
-                            # Convert to RGB if needed
-                            if pil_img.mode in ('RGBA', 'P'):
-                                pil_img = pil_img.convert('RGB')
-                            img_width, img_height = pil_img.size
-                            # Scale to fit page width
-                            max_width = page_width
-                            if img_width > max_width:
-                                ratio = max_width / img_width
-                                img_width = max_width
-                                img_height = img_height * ratio
-                            # Limit height to avoid too large images
-                            max_height = A4[1] * 0.6
-                            if img_height > max_height:
-                                ratio = max_height / img_height
-                                img_height = max_height
-                                img_width = img_width * ratio
+            elif element.name == 'p':
+                text = element.get_text(strip=True)
+                if text:
+                    safe_text = html_module.escape(text)
+                    story.append(Paragraph(safe_text, normal_style))
 
-                            img_buf = io.BytesIO()
-                            pil_img.save(img_buf, format='JPEG', quality=85)
-                            img_buf.seek(0)
-                            rl_img = RLImage(img_buf, width=img_width, height=img_height)
-                            story.append(Spacer(1, 4*mm))
-                            story.append(rl_img)
-                            story.append(Spacer(1, 4*mm))
-                        except Exception as e:
-                            print(f"  [Warning] Could not process image {src}: {e}")
+            elif element.name == 'img':
+                src = element.get('src', '')
+                if not src:
+                    continue
+                img_data = None
+                img_path = src
+                # Try to resolve relative paths
+                if img_path in image_map:
+                    img_data = image_map[img_path]
+                elif os.path.basename(img_path) in image_map:
+                    img_data = image_map[os.path.basename(img_path)]
+                else:
+                    # Try matching by longest suffix
+                    matches = [k for k in image_map if img_path.endswith(k) or k.endswith(img_path)]
+                    if matches:
+                        img_data = image_map[matches[0]]
 
+                if img_data:
+                    try:
+                        pil_img = Image.open(io.BytesIO(img_data))
+                        # Convert to RGB if needed
+                        if pil_img.mode in ('RGBA', 'P'):
+                            pil_img = pil_img.convert('RGB')
+                        img_width, img_height = pil_img.size
+                        # Scale to fit page width
+                        max_width = page_width
+                        if img_width > max_width:
+                            ratio = max_width / img_width
+                            img_width = max_width
+                            img_height = img_height * ratio
+                        # Limit height to avoid too large images
+                        max_height = A4[1] * 0.6
+                        if img_height > max_height:
+                            ratio = max_height / img_height
+                            img_height = max_height
+                            img_width = img_width * ratio
+
+                        img_buf = io.BytesIO()
+                        pil_img.save(img_buf, format='JPEG', quality=85)
+                        img_buf.seek(0)
+                        rl_img = RLImage(img_buf, width=img_width, height=img_height)
+                        story.append(Spacer(1, 4*mm))
+                        story.append(rl_img)
+                        story.append(Spacer(1, 4*mm))
+                    except Exception as e:
+                        print(f"  [Warning] Could not process image {src}: {e}", flush=True)
+
+    print("[PROGRESS] 88% - กำลังสร้างเอกสาร PDF...", flush=True)
     doc.build(story)
-    print(f"Converted: {epub_path} -> {pdf_path}")
+    print("[PROGRESS] 100% - แปลงไฟล์ EPUB เป็น PDF สำเร็จ", flush=True)
+    print(f"Converted: {epub_path} -> {pdf_path}", flush=True)
     return pdf_path
 
 if __name__ == '__main__':
