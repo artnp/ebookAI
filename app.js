@@ -4287,7 +4287,7 @@ function updateLatestBigdataDisplay(filename, line) {
     const el = document.getElementById('latestBigdataInfo');
     if (!el) return;
     if (filename && line) {
-        el.textContent = `💾 ${filename} (บรรทัด ${line})`;
+        el.innerHTML = `<span class="bigdata-file">💾 ${filename}</span> <span class="bigdata-line">(บรรทัด ${line})</span>`;
         el.style.display = 'inline-flex';
         localStorage.setItem('latestBigdataFile', filename);
         localStorage.setItem('latestBigdataLine', String(line));
@@ -4295,10 +4295,10 @@ function updateLatestBigdataDisplay(filename, line) {
         const savedFile = localStorage.getItem('latestBigdataFile');
         const savedLine = localStorage.getItem('latestBigdataLine');
         if (savedFile && savedLine) {
-            el.textContent = `💾 ${savedFile} (บรรทัด ${savedLine})`;
+            el.innerHTML = `<span class="bigdata-file">💾 ${savedFile}</span> <span class="bigdata-line">(บรรทัด ${savedLine})</span>`;
             el.style.display = 'inline-flex';
         } else {
-            el.textContent = `💾 bigdata1.json (บรรทัด 1)`;
+            el.innerHTML = `<span class="bigdata-file">💾 bigdata1.json</span> <span class="bigdata-line">(บรรทัด 1)</span>`;
             el.style.display = 'inline-flex';
         }
         fetchLatestBigdataInfoFromGitHub();
