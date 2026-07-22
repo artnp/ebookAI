@@ -238,18 +238,27 @@ body.gemini-full .gemini-panel {
   display: inline-flex;
   align-items: center;
   gap: 4px;
-  font-size: 12px;
-  font-weight: 500;
-  color: #38bdf8;
-  background: rgba(56, 189, 248, 0.12);
-  border: 1px solid rgba(56, 189, 248, 0.3);
-  border-radius: 6px;
-  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 400;
+  color: #94a3b8;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
   white-space: nowrap;
-  max-width: 220px;
+  max-width: 320px;
   overflow: hidden;
   text-overflow: ellipsis;
   -webkit-app-region: no-drag;
+}
+
+.latest-bigdata-info .bigdata-file {
+  color: #ffffff;
+  font-weight: 500;
+}
+
+.latest-bigdata-info .bigdata-line {
+  color: #94a3b8;
 }
 
 .page-info {
@@ -729,6 +738,201 @@ input:checked+.toggle-slider:before {
   display: flex;
   align-items: center;
   justify-content: center;
+}
+
+/* GRID VIEW (Library Bookshelf) */
+.bookshelf .book-item {
+  display: flex;
+  flex-direction: column;
+  padding: 15px;
+  gap: 12px;
+  height: 100%;
+  /* Ensure full height in grid */
+  text-align: center;
+}
+
+.bookshelf .book-item:hover {
+  transform: translateY(-5px);
+  border-color: var(--accent-primary);
+  box-shadow: 0 10px 25px rgba(99, 102, 241, 0.2);
+  background: var(--bg-hover);
+}
+
+.bookshelf .book-cover {
+  height: 180px;
+  /* Tall cover */
+  width: 100%;
+  background: linear-gradient(135deg, var(--bg-tertiary), var(--bg-secondary));
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 48px;
+  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+  border: 1px solid var(--border-color);
+  margin: 0 auto;
+}
+
+.bookshelf .book-info {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: center;
+}
+
+.bookshelf .book-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.4;
+  height: auto;
+  /* Let it grow */
+  margin-bottom: 0;
+}
+
+.bookshelf .book-progress {
+  font-size: 11px;
+  color: var(--text-muted);
+  justify-content: center;
+  /* Center progress text */
+}
+
+.bookshelf .book-progress-bar {
+  height: 4px;
+  background: var(--bg-tertiary);
+  border-radius: 2px;
+  width: 100%;
+  margin-top: 4px;
+}
+
+.bookshelf .book-progress-fill {
+  height: 100%;
+  background: var(--accent-primary);
+  border-radius: 2px;
+}
+
+/* Share Modal */
+.share-modal {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.7);
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  visibility: hidden;
+  transition: all 0.2s;
+  backdrop-filter: blur(4px);
+}
+
+.share-modal.show {
+  opacity: 1;
+  visibility: visible;
+}
+
+.share-content {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 24px;
+  width: 90%;
+  max-width: 500px;
+  box-shadow: var(--shadow-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  transform: scale(0.9);
+  transition: transform 0.2s ease-out;
+}
+
+.share-modal.show .share-content {
+  transform: scale(1);
+}
+
+.share-content h3 {
+  color: var(--text-primary);
+  font-size: 1.2rem;
+  margin-top: 0;
+}
+
+#shareText {
+  width: 100%;
+  min-height: 150px;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  padding: 12px;
+  font-family: inherit;
+  font-size: 14px;
+  resize: vertical;
+  line-height: 1.5;
+  outline: none;
+}
+
+#shareText:focus {
+  border-color: var(--accent-primary);
+}
+
+.share-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+/* --- Bigdata Popup Iframe --- */
+.bigdata-popup {
+  position: absolute;
+  top: 50%;
+  left: 5%;
+  width: 90%;
+  height: 80%;
+  transform: translateY(-50%);
+  background: #0d1117; /* Matches bigdata search background */
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: popupFadeIn 0.3s ease;
+}
+
+@keyframes popupFadeIn {
+  from { opacity: 0; transform: translateY(-50%) scale(0.95); }
+  to { opacity: 1; transform: translateY(-50%) scale(1); }
+}
+
+.bigdata-popup iframe {
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+
+.popup-close-btn {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 28px;
+  height: 28px;
+  background: rgba(0, 0, 0, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: white;
+  border-radius: 50%;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   font-size: 14px;
   z-index: 101;
   transition: background 0.2s, border-color 0.2s;
@@ -774,12 +978,14 @@ input:checked+.toggle-slider:before {
 /* Gemini Panel Bottom Footer */
 .gemini-footer {
   display: flex;
+  flex-direction: column;
   justify-content: center;
   align-items: center;
-  padding: 12px 16px;
+  gap: 4px;
+  padding: 8px 16px;
   background: var(--bg-secondary);
   border-top: 1px solid var(--border-color);
-  height: 64px;
+  min-height: 64px;
 }
 
 .next-page-bottom-btn {
