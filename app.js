@@ -4203,6 +4203,28 @@ function handleKeyboard(e) {
     }
 }
 
+async function parseGitHubApiError(res) {
+    if (!res) return 'ไม่ได้รับตอบกลับจากเซิร์ฟเวอร์ GitHub';
+    let detailMsg = '';
+    try {
+        const clone = res.clone();
+        const errData = await clone.json();
+        if (errData && errData.message) {
+            detailMsg = `: ${errData.message}`;
+        }
+    } catch (_) {}
+
+    if (res.status === 401) return `Token GitHub ไม่ถูกต้องหรือหมดอายุ (HTTP 401${detailMsg})`;
+    if (res.status === 403) return `ไม่มีสิทธิ์เขียน repo หรือถูกจำกัด Rate Limit จาก GitHub (HTTP 403${detailMsg})`;
+    if (res.status === 404) return `ไม่พบ Repository หรือ Path ใน GitHub (HTTP 404${detailMsg})`;
+    if (res.status === 409) return `เกิดไฟล์ชนกันใน GitHub (Conflict HTTP 409${detailMsg})`;
+    if (res.status === 413) return `ไฟล์ภาพมีขนาดใหญ่เกินกว่าที่ GitHub API อนุญาต (HTTP 413${detailMsg})`;
+    if (res.status === 422) return `รูปแบบข้อมูลไม่ถูกต้องสำหรับ GitHub (HTTP 422${detailMsg})`;
+    if (res.status >= 500) return `เซิร์ฟเวอร์ GitHub ขัดข้องชั่วคราว (HTTP ${res.status}${detailMsg})`;
+    
+    return `ข้อผิดพลาดจาก GitHub (HTTP ${res.status}${detailMsg})`;
+}
+
 async function getGitHubFile(filename, options = null, retries = 3) {
     const url = `https://api.github.com/repos/${GITHUB_USER}/${GITHUB_REPO}/contents/${filename}`;
     for (let attempt = 1; attempt <= retries; attempt++) {
@@ -4210,7 +4232,8 @@ async function getGitHubFile(filename, options = null, retries = 3) {
             const res = await fetch(url, { headers: { 'Authorization': `token ${GITHUB_TOKEN}` } });
             if (res.status === 404) return null;
             if (res.status === 401 || res.status === 403) {
-                if (!options || !options.silent) showToast('Token GitHub ไม่ถูกต้องหรือหมดอายุ', 'error');
+                const errMsg = await parseGitHubApiError(res);
+                if (!options || !options.silent) showToast(errMsg, 'error');
                 return 'ERR_AUTH';
             }
             if (res.status === 502 || res.status === 503 || res.status === 429) {
@@ -4221,7 +4244,8 @@ async function getGitHubFile(filename, options = null, retries = 3) {
                 }
             }
             if (!res.ok) {
-                if (!options || !options.silent) showToast('ติดต่อ GitHub ไม่ได้ (Status: ' + res.status + ')', 'error');
+                const errMsg = await parseGitHubApiError(res);
+                if (!options || !options.silent) showToast(errMsg, 'error');
                 return 'ERR_NET';
             }
             const data = await res.json();
@@ -4244,7 +4268,7 @@ async function getGitHubFile(filename, options = null, retries = 3) {
                 await new Promise(r => setTimeout(r, 1000 * attempt));
                 continue;
             }
-            if (!options || !options.silent) showToast('ติดต่อ GitHub ไม่ได้ (network error)', 'error');
+            if (!options || !options.silent) showToast('ติดต่อ GitHub ไม่ได้ (Network error)', 'error');
             return 'ERR_NET';
         }
     }
@@ -4411,15 +4435,19 @@ async function putGitHubFile(filename, contentObj, sha, options = null, retries 
                     await new Promise(r => setTimeout(r, 500 * attempt));
                     continue;
                 }
-                if (!options || !options.silent) showToast('ไฟล์ชนกัน ลองอีกครั้ง', 'warning');
+                const errMsg = await parseGitHubApiError(res);
+                if (!options || !options.silent) showToast(errMsg, 'warning');
             } else if (res.status === 502 || res.status === 503) {
                 if (attempt < retries) {
                     await new Promise(r => setTimeout(r, 1000 * attempt));
                     continue;
                 }
-                if (!options || !options.silent) showToast('บันทึกไม่สำเร็จ (GitHub server error)', 'error');
+                const errMsg = await parseGitHubApiError(res);
+                if (!options || !options.silent) showToast(errMsg, 'error');
             } else {
-                if (!options || !options.silent) showToast('บันทึกไม่สำเร็จ (' + res.status + ')', 'error');
+                const errMsg = await parseGitHubApiError(res);
+                if (!options || !options.silent) showToast(errMsg, 'error');
+                return { ok: false, error: errMsg };
             }
         } catch (e) {
             console.error('putGitHubFile error:', e);
@@ -4427,7 +4455,7 @@ async function putGitHubFile(filename, contentObj, sha, options = null, retries 
                 await new Promise(r => setTimeout(r, 1000 * attempt));
                 continue;
             }
-            if (!options || !options.silent) showToast('บันทึกไม่สำเร็จ (network error)', 'error');
+            if (!options || !options.silent) showToast('บันทึกไม่สำเร็จ (Network connection error)', 'error');
         }
     }
     return { ok: false };
@@ -5828,7 +5856,9 @@ async function uploadTextAndImageWithBlock(text) {
     }
 
     if (!uploadRes.ok) {
-        setUploadStatus(100, 'อัปโหลดภาพไม่สำเร็จ (HTTP ' + uploadRes.status + ')', 'error', 'บันทึกไม่สำเร็จ');
+        const errMsg = await parseGitHubApiError(uploadRes);
+        setUploadStatus(100, `อัปโหลดภาพไม่สำเร็จ: ${errMsg}`, 'error', 'บันทึกไม่สำเร็จ');
+        showToast(errMsg, 'error');
         return null;
     }
 
@@ -6468,9 +6498,10 @@ async function uploadScreenshotAndSave(text) {
         }
 
         if (!uploadRes.ok) {
-            const errData = await uploadRes.json().catch(() => ({}));
-            setUploadStatus(100, `อัปโหลดภาพไม่สำเร็จ (HTTP ${uploadRes.status})`, 'error', 'บันทึกไม่สำเร็จ');
-            console.error('GitHub image upload failed:', errData);
+            const errMsg = await parseGitHubApiError(uploadRes);
+            setUploadStatus(100, `อัปโหลดภาพไม่สำเร็จ: ${errMsg}`, 'error', 'บันทึกไม่สำเร็จ');
+            showToast(errMsg, 'error');
+            console.error('GitHub image upload failed:', errMsg);
             return;
         }
 
