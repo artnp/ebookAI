@@ -701,10 +701,12 @@ function setupEventListeners() {
                 var edgeText = msg.substring('__TTS_EDGE__:'.length);
                 var ttsGeneration = (window.edgeTtsGeneration || 0) + 1;
                 window.edgeTtsGeneration = ttsGeneration;
+                window.__ttsLoadingAudio = true; // Mark audio is currently loading
                 if (!window.__ttsCache) window.__ttsCache = {};
                 function playTTS(audioData, dur) {
                     // Ignore a response that arrived after the reader moved to another item/page.
                     if (ttsGeneration !== window.edgeTtsGeneration) return;
+                    window.__ttsLoadingAudio = false; // Audio is ready!
                     if (window.__edgeAudio) {
                         window.__edgeAudio.pause();
                         if (window.__edgeAudio._ebookUrl) URL.revokeObjectURL(window.__edgeAudio._ebookUrl);
@@ -718,6 +720,13 @@ function setupEventListeners() {
                         window.__edgeAudio.volume = 1;
                         window.__edgeAudio.play().catch(function(e) { console.error('EdgeTTS play error:', e); });
                         webview.executeJavaScript('window.__ttsStart && window.__ttsStart(' + dur + ')');
+                        
+                        // Execute the deferred PDF scroll now that audio is playing!
+                        if (typeof window.executeDeferredPdfScroll === 'function') {
+                            window.executeDeferredPdfScroll();
+                            window.executeDeferredPdfScroll = null;
+                        }
+
                         window.__edgeAudio.onended = function() {
                             URL.revokeObjectURL(audioUrl);
                             if (ttsGeneration !== window.edgeTtsGeneration) return;
@@ -726,6 +735,10 @@ function setupEventListeners() {
                     } catch(e) {
                         console.error('EdgeTTS audio error:', e);
                         showToast('TTS audio error', 'error');
+                        if (typeof window.executeDeferredPdfScroll === 'function') {
+                            window.executeDeferredPdfScroll();
+                            window.executeDeferredPdfScroll = null;
+                        }
                     }
                 }
                 var cached = window.__ttsCache[edgeText];
@@ -733,13 +746,32 @@ function setupEventListeners() {
                 window.electronAPI.edgeSpeak(edgeText).then(function(res) {
                     if (ttsGeneration !== window.edgeTtsGeneration) return;
                     if (res && res.error) {
+                        window.__ttsLoadingAudio = false;
+                        if (typeof window.executeDeferredPdfScroll === 'function') {
+                            window.executeDeferredPdfScroll();
+                            window.executeDeferredPdfScroll = null;
+                        }
                         console.error('EdgeTTS error:', res.error);
                         showToast('TTS ล้มเหลว ลองอีกครั้ง', 'error');
                         return;
                     }
                     window.__ttsCache[edgeText] = { audio: res.audio, duration: res.duration };
                     playTTS(res.audio, res.duration);
+                }).catch(function(e) {
+                    window.__ttsLoadingAudio = false;
+                    if (typeof window.executeDeferredPdfScroll === 'function') {
+                        window.executeDeferredPdfScroll();
+                        window.executeDeferredPdfScroll = null;
+                    }
                 });
+            } else if (msg.startsWith('__CHECK_LI_IMAGES__:')) {
+                if (isPrefetch) return;
+                try {
+                    const checkItems = JSON.parse(msg.substring('__CHECK_LI_IMAGES__:'.length));
+                    void checkAndFilterLiImages(checkItems);
+                } catch(e) {
+                    console.error('Failed to parse __CHECK_LI_IMAGES__:', e);
+                }
             } else if (msg.startsWith('__HIGHLIGHT_NOW__:')) {
                 if (isPrefetch) return;
                 const terms = msg.substring('__HIGHLIGHT_NOW__:'.length).trim();
@@ -1070,7 +1102,7 @@ async function ensurePageLayoutBlocks(pageNum) {
 }
 
 // เลือกภาพประกอบแบบ retry: เริ่มจากภาพที่อยู่ติด anchor มากที่สุด แล้วค่อยผ่อนระยะค้นหา
-// ให้สิทธิ์ภาพประกอบจากการวิเคราะห์ PDF layout แม้ canvas ใน DOM จะยังวาดพิกเซลไม่เสร็จในรอบแรก
+// พัฒนาใหม่: รองรับไดอะแกรมขนาดใหญ่, ภาพแปลน, ภาพประกอบลายเส้น และมี Page-level Fallback
 async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, canvasH) {
     let blocks = getPageLayoutBlocksAtScale(pageNum, scale);
     if (!blocks || blocks.length === 0) {
@@ -1082,12 +1114,12 @@ async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, can
 
     const pageArea = Math.max(1, canvasW * canvasH);
     const center = getRectCenter(textRegion);
-    // Never allow a page/spread-sized region to masquerade as one illustration.
-    // The fallback must be the article, not a screenshot of an entire page.
-    const MAX_ILLUSTRATION_FRACTION = 0.26;
-    // ขยายรัศมีเพียงเท่าที่ภาพยังนับว่าเป็นบริบทของย่อหน้า
-    // ไม่ค้นข้ามไปเลือกภาพตกแต่ง/หัวข้ออื่นบนหน้าเดียวกัน
-    const passes = [0.24, 0.38, 0.50];
+
+    // ปรับเพิ่มให้รองรับภาพผัง ไดอะแกรมขนาดใหญ่ถึง 88% ของหน้ากระดาษ (ตัดเฉพาะกระดาษเปล่าทั้งหน้า > 94%)
+    const MAX_ILLUSTRATION_FRACTION = 0.88;
+
+    // ขยาย 3 ระยะ: ติดชิดย่อหน้า (35%), ในระยะสายตา (60%), ทั่วทั้งหน้า (90%)
+    const passes = [0.35, 0.60, 0.90];
     for (let pass = 0; pass < passes.length; pass++) {
         const maxDistance = canvasH * passes[pass];
         const candidates = blocks
@@ -1096,9 +1128,9 @@ async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, can
                 const ratio = block.w / Math.max(1, block.h);
                 const areaFraction = area / pageArea;
                 const pageSized = areaFraction > MAX_ILLUSTRATION_FRACTION ||
-                    block.w > canvasW * 0.68 || block.h > canvasH * 0.78;
+                    (block.w > canvasW * 0.97 && block.h > canvasH * 0.94);
                 return block.kind !== 'noise' && !pageSized &&
-                    area >= Math.max(3500, pageArea * 0.004) && ratio >= 0.16 && ratio <= 6.2;
+                    area >= Math.max(1500, pageArea * 0.003) && ratio >= 0.12 && ratio <= 8.5;
             })
             .map(block => {
                 const c = getRectCenter(block);
@@ -1106,37 +1138,34 @@ async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, can
                 const distance = Math.hypot(dx, dy);
                 const overlap = getOverlapArea(textRegion, block);
                 const evidence = getVisualEvidence(canvas, block);
-                // PDF บางเล่มรวมภาพกับพื้นผิว/คำบรรยายจน layout detector เรียกว่า text
-                // จึงใช้สีและขนาดของบล็อกเป็นสิทธิ์ผ่านเพิ่ม แต่ไม่รับ text ดำธรรมดา
+
                 const areaFraction = (block.w * block.h) / pageArea;
-                const imageClass = block.kind === 'image' || (block.kind === 'mixed' && block.textCoverage <= 0.25);
-                const colorfulGraphic = evidence.colorRatio >= 0.018 && areaFraction >= 0.010 && areaFraction <= MAX_ILLUSTRATION_FRACTION;
-                const largeGraphic = block.kind === 'text' && evidence.colorRatio >= 0.030 &&
-                    block.h >= canvasH * 0.11 && block.w >= canvasW * 0.18;
+                const imageClass = block.kind === 'image' || block.source === 'pdf-object' || (block.kind === 'mixed' && (block.textCoverage === undefined || block.textCoverage <= 0.40));
+                const colorfulGraphic = evidence.colorRatio >= 0.015 && areaFraction >= 0.008 && areaFraction <= MAX_ILLUSTRATION_FRACTION;
+                const largeGraphic = (block.kind === 'text' || block.kind === 'mixed') && (evidence.inkRatio >= 0.04 || evidence.colorRatio >= 0.02) &&
+                    block.h >= canvasH * 0.08 && block.w >= canvasW * 0.15;
                 const isIllustration = imageClass || colorfulGraphic || largeGraphic;
 
-                // ความสัมพันธ์ที่ต้องการที่สุด: ภาพติดใต้/ข้างย่อหน้าที่ Gemini เลือก
                 const horizontalOverlap = Math.max(0, Math.min(textRegion.x + textRegion.w, block.x + block.w) - Math.max(textRegion.x, block.x));
                 const verticalOverlap = Math.max(0, Math.min(textRegion.y + textRegion.h, block.y + block.h) - Math.max(textRegion.y, block.y));
                 const gapBelow = Math.max(0, block.y - (textRegion.y + textRegion.h));
                 const gapSide = Math.max(0, Math.max(textRegion.x, block.x) - Math.min(textRegion.x + textRegion.w, block.x + block.w));
-                const adjacentBelow = horizontalOverlap >= Math.min(textRegion.w, block.w) * 0.18 && gapBelow <= canvasH * 0.30;
-                const adjacentSide = verticalOverlap >= Math.min(textRegion.h, block.h) * 0.24 && gapSide <= canvasW * 0.22;
-                // same column/row และภาพที่อยู่เหนือหัวข้อ (caption/heading) เป็นความสัมพันธ์รอง
-                const aligned = dx <= Math.max(block.w * 0.85, canvasW * 0.20);
-                const score = (overlap ? 100000 : 0) + (adjacentBelow ? 42000 : 0) +
-                    (adjacentSide ? 27000 : 0) + (aligned ? 9000 : 0) +
+                const adjacentBelow = horizontalOverlap >= Math.min(textRegion.w, block.w) * 0.15 && gapBelow <= canvasH * 0.40;
+                const adjacentSide = verticalOverlap >= Math.min(textRegion.h, block.h) * 0.18 && gapSide <= canvasW * 0.30;
+                const aligned = dx <= Math.max(block.w * 0.90, canvasW * 0.25);
+                const score = (overlap ? 100000 : 0) + (adjacentBelow ? 45000 : 0) +
+                    (adjacentSide ? 30000 : 0) + (aligned ? 12000 : 0) +
+                    (block.source === 'pdf-object' ? 50000 : 0) +
                     (evidence.inkRatio * 24000) + (evidence.colorRatio * 16000) +
-                    (block.w * block.h * 0.006) - distance * 13;
+                    (block.w * block.h * 0.005) - distance * 10;
                 return { block, distance, aligned, adjacentBelow, adjacentSide, isIllustration, imageClass, evidence, score };
             })
             .filter(candidate => {
-                const isUsable = candidate.evidence.usable || (candidate.imageClass && (!canvas || (candidate.evidence.inkRatio === 0 && candidate.evidence.colorRatio === 0)));
+                const isUsable = candidate.evidence.usable || candidate.block.source === 'pdf-object' || (candidate.imageClass && (!canvas || (candidate.evidence.inkRatio === 0 && candidate.evidence.colorRatio === 0)));
                 if (!candidate.isIllustration || !isUsable) return false;
-                // ต้องติดย่อหน้า หรืออย่างน้อยอยู่ใกล้และอยู่ในแนวเดียวกันจริง ๆ
                 return candidate.adjacentBelow || candidate.adjacentSide ||
                     (candidate.aligned && candidate.distance <= maxDistance) ||
-                    candidate.distance <= maxDistance * 0.62;
+                    candidate.distance <= maxDistance;
             })
             .sort((a, b) => b.score - a.score);
 
@@ -1144,12 +1173,34 @@ async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, can
             const best = candidates[0];
             console.log(`[Smart Crop] illustration retry ${pass + 1}/3 accepted`, {
                 size: `${Math.round(best.block.w)}x${Math.round(best.block.h)}`,
-                ink: best.evidence.inkRatio.toFixed(3), distance: Math.round(best.distance)
+                ink: best.evidence.inkRatio.toFixed(3), distance: Math.round(best.distance),
+                source: best.block.source || 'layout'
             });
             return best.block;
         }
-        console.warn(`[Smart Crop] illustration retry ${pass + 1}/3 found no verified image`);
     }
+
+    // Pass 4 (Page-level Fallback): หากระยะทางเกิน แต่ในหน้านั้นมีภาพประกอบจริง ให้ดึงภาพที่ดีที่สุดบนหน้ามาใช้งานทันที
+    const allPageIllustrations = blocks.filter(b => {
+        const area = b.w * b.h;
+        const areaFraction = area / pageArea;
+        const isIll = b.kind === 'image' || b.source === 'pdf-object' || (b.kind === 'mixed' && (b.textCoverage === undefined || b.textCoverage <= 0.40));
+        return isIll && areaFraction <= MAX_ILLUSTRATION_FRACTION && area >= 2500;
+    }).sort((a, b) => {
+        const cA = getRectCenter(a), cB = getRectCenter(b);
+        const distA = Math.hypot(cA.x - center.x, cA.y - center.y);
+        const distB = Math.hypot(cB.x - center.x, cB.y - center.y);
+        return distA - distB || (b.w * b.h) - (a.w * a.h);
+    });
+
+    if (allPageIllustrations.length > 0) {
+        console.log('[Smart Crop] Page-level fallback: selected best illustration on page', {
+            size: `${Math.round(allPageIllustrations[0].w)}x${Math.round(allPageIllustrations[0].h)}`,
+            source: allPageIllustrations[0].source || 'layout'
+        });
+        return allPageIllustrations[0];
+    }
+
     return null;
 }
 
@@ -1205,10 +1256,9 @@ function expandRegionWithLayoutBlocks(pageNum, region, canvasWidth = 0, canvasHe
     const imageCandidates = typedBlocks
         .filter(b => {
             const bArea = b.w * b.h;
-            if (bArea < MIN_IMAGE_AREA) return false; // ตัดภาพที่เล็กเกินออก
-            if (b.kind === 'image') return true;
-            // mixed: ต้องมีพื้นที่ >= 3% ของหน้า และ textCoverage ต่ำ (ไม่ใช่แค่ text)
-            if (b.kind === 'mixed' && (b.areaFraction || 0) >= 0.03 && (b.textCoverage || 0) <= 0.25) return true;
+            if (bArea < MIN_IMAGE_AREA) return false;
+            if (b.kind === 'image' || b.source === 'pdf-object') return true;
+            if (b.kind === 'mixed' && (b.textCoverage || 0) <= 0.40) return true;
             return false;
         })
         .map(b => {
@@ -1227,8 +1277,8 @@ function expandRegionWithLayoutBlocks(pageNum, region, canvasWidth = 0, canvasHe
 
     const bestImage = imageCandidates.length > 0 ? imageCandidates[0] : null;
 
-    // 2. ถ้ามีภาพ + อยู่ในระยะสมเหตุสมผล (25% ของความสูงหน้า หรือ overlap)
-    const imageDistThreshold = canvasHeight > 0 ? canvasHeight * 0.25 : 500;
+    // 2. ถ้ามีภาพ + อยู่ในระยะสมเหตุสมผล
+    const imageDistThreshold = canvasHeight > 0 ? canvasHeight * 0.65 : 800;
     if (bestImage && (bestImage.overlap > 0 || bestImage.dist < imageDistThreshold)) {
         let region = createUnionRect([seed, bestImage.block]) || seed;
         const usedBlocks = new Set();
@@ -1243,7 +1293,7 @@ function expandRegionWithLayoutBlocks(pageNum, region, canvasWidth = 0, canvasHe
             if (gap.y > 60 || gap.x > 60) continue;
             const candidate = createUnionRect([region, b]);
             if (!candidate) continue;
-            if (getRegionAreaFraction(candidate, canvasWidth, canvasHeight) > 0.30) continue;
+            if (getRegionAreaFraction(candidate, canvasWidth, canvasHeight) > 0.85) continue;
             region = candidate;
             usedBlocks.add(b);
         }
@@ -1258,9 +1308,9 @@ function expandRegionWithLayoutBlocks(pageNum, region, canvasWidth = 0, canvasHe
         };
         if (canvasWidth > 0) region = clampRegionToCanvas(region, canvasWidth, canvasHeight);
 
-        // Max size limit
-        const maxW = canvasWidth * 0.62;
-        const maxH = canvasHeight * 0.58;
+        // Max size limit (allow large diagrams up to 96% width and 92% height)
+        const maxW = canvasWidth * 0.96;
+        const maxH = canvasHeight * 0.92;
         if (canvasWidth > 0 && region.w > maxW) region.w = maxW;
         if (canvasHeight > 0 && region.h > maxH) region.h = maxH;
         if (canvasWidth > 0) region = clampRegionToCanvas(region, canvasWidth, canvasHeight);
@@ -1332,9 +1382,8 @@ function findBestImageForRegion(pageNum, textRegion, canvasW, canvasH) {
         .filter(b => {
             const bArea = b.w * b.h;
             if (bArea < MIN_IMAGE_AREA) return false;
-            if (b.kind === 'image') return true;
-            // mixed block: ต้องมีพื้นที่ >= 3% และ textCoverage ต่ำ
-            if (b.kind === 'mixed' && (b.areaFraction || 0) >= 0.03 && (b.textCoverage || 0) <= 0.20) return true;
+            if (b.kind === 'image' || b.source === 'pdf-object') return true;
+            if (b.kind === 'mixed' && (b.textCoverage || 0) <= 0.40) return true;
             return false;
         })
         .map(b => {
@@ -1354,8 +1403,8 @@ function findBestImageForRegion(pageNum, textRegion, canvasW, canvasH) {
     if (candidates.length === 0) return null;
 
     const best = candidates[0];
-    // ยอมรับเฉพาะภาพที่ overlap กับ seed หรืออยู่ในระยะ 30% ของความสูงหน้า
-    const maxDist = canvasH > 0 ? canvasH * 0.30 : 400;
+    // ยอมรับภาพที่ overlap กับ seed หรืออยู่ในระยะ 70% ของความสูงหน้า
+    const maxDist = canvasH > 0 ? canvasH * 0.70 : 800;
     if (best.overlap > 0 || best.dist <= maxDist) {
         return best.block;
     }
@@ -1428,10 +1477,152 @@ function drawContextHighlight(pageNum, region) {
     return overlay;
 }
 
-function syncOverlayFlagToWebview() {
+function syncOverlayFlagToWebview(hasRealImage) {
     if (!geminiWebview || !geminiWebview.executeJavaScript) return;
-    const hasOverlay = document.querySelector('.highlight-overlay') !== null;
+    const hasOverlay = (hasRealImage !== undefined) ? !!hasRealImage : (document.querySelector('.highlight-overlay') !== null);
     geminiWebview.executeJavaScript('try{ if(window.updateSaveButtons){ window.updateSaveButtons(' + hasOverlay + '); } else { window.__hasOverlay__=' + hasOverlay + '; } }catch(e){}').catch(() => { });
+}
+
+async function checkAndFilterLiImages(items) {
+    if (!pdfDoc || !items || !items.length || !geminiWebview) return;
+
+    const startPage = currentPage;
+    const endPage = Math.min(currentPage + batchSize - 1, totalPages);
+
+    for (let p = startPage; p <= endPage; p++) {
+        await ensurePageLayoutBlocks(p);
+    }
+
+    // Collect all pages in this batch that have image blocks
+    const pagesWithImages = new Set();
+    for (let p = startPage; p <= endPage; p++) {
+        const blocks = pageLayoutBlocks[p] || [];
+        if (blocks.some(b => b.kind === 'image' || b.source === 'pdf-object' || b.kind === 'vector' || (b.kind === 'mixed' && (b.textCoverage === undefined || b.textCoverage <= 0.40)))) {
+            pagesWithImages.add(p);
+        }
+    }
+
+    // If no page in this batch has any image block, fall back to showing all items
+    if (pagesWithImages.size === 0) {
+        geminiWebview.executeJavaScript('window.applyLiImageFilter && window.applyLiImageFilter([])').catch(() => {});
+        return;
+    }
+
+    function extractTerms(text) {
+        const terms = [];
+        if (!text) return terms;
+        // 1. Text inside parentheses: "(Roof Pitch, Slope, 6-in-12 Pitch)"
+        const pMatches = text.match(/\(([^)]+)\)/g) || [];
+        for (const pm of pMatches) {
+            const clean = pm.replace(/[()]/g, '').trim();
+            clean.split(/[,/]/).forEach(t => {
+                const s = t.trim().replace(/[*_]/g, '');
+                if (s.length >= 2) terms.push(s);
+            });
+        }
+        // 2. English words >= 3 chars
+        const engWords = text.match(/[A-Za-z0-9/-]{3,}/g) || [];
+        for (const w of engWords) {
+            if (!STOPWORDS.has(w.toLowerCase())) terms.push(w);
+        }
+        // 3. Thai title at the beginning
+        const titleM = text.match(/^([^(:]+)/);
+        if (titleM && titleM[1]) {
+            const t = titleM[1].trim().replace(/[*_]/g, '');
+            if (t.length >= 2) terms.push(t);
+        }
+        return Array.from(new Set(terms));
+    }
+
+    const imageIndices = [];
+
+    for (const item of items) {
+        try {
+            const terms = extractTerms(item.text);
+            const anchor = findEnglishAnchor(item.text);
+
+            let matchedPage = anchor ? findFastPageForAnchor(anchor) : null;
+            if (!matchedPage || matchedPage < startPage || matchedPage > endPage) {
+                matchedPage = null;
+                for (const p of pagesWithImages) {
+                    const pText = pageTextMap[p] || '';
+                    if (terms.some(t => pText.toLowerCase().includes(t.toLowerCase()))) {
+                        matchedPage = p;
+                        break;
+                    }
+                }
+                if (!matchedPage) matchedPage = Array.from(pagesWithImages)[0] || startPage;
+            }
+
+            const blocks = getPageLayoutBlocksAtScale(matchedPage, scale);
+            const imgBlocks = (blocks || []).filter(b => b.kind === 'image' || b.source === 'pdf-object' || b.kind === 'vector' || (b.kind === 'mixed' && (b.textCoverage === undefined || b.textCoverage <= 0.40)));
+
+            let foundImage = false;
+
+            if (imgBlocks.length > 0) {
+                const wrapper = document.getElementById(`page-wrapper-${matchedPage}`);
+                const canvas = wrapper ? wrapper.querySelector('canvas') : null;
+                const canvasW = canvas ? canvas.width : 800;
+                const canvasH = canvas ? canvas.height : 1100;
+
+                const page = await pdfDoc.getPage(matchedPage);
+                const content = await page.getTextContent();
+                const viewport = page.getViewport({ scale: scale });
+                const pageMatches = [];
+
+                for (const ci of content.items) {
+                    const strNorm = normalizeSearchText(ci.str || '');
+                    if (strNorm.length < 2) continue;
+                    for (const term of terms) {
+                        const termNorm = normalizeSearchText(term);
+                        if (termNorm.length < 2) continue;
+                        if (strNorm === termNorm || strNorm.includes(termNorm) || termNorm.includes(strNorm)) {
+                            pageMatches.push({ rect: getTextItemRect(ci, viewport), term });
+                            break;
+                        }
+                    }
+                }
+
+                if (pageMatches.length > 0) {
+                    const region = createUnionRect(pageMatches.map(m => m.rect));
+                    const ill = await findBestIllustrationWithRetries(matchedPage, region, canvasW, canvasH);
+                    if (ill) {
+                        foundImage = true;
+                    } else {
+                        // Proximity check to image blocks
+                        for (const m of pageMatches) {
+                            for (const ib of imgBlocks) {
+                                const gap = getRectGap(m.rect, ib);
+                                if (gap.x < canvasW * 0.7 && gap.y < canvasH * 0.7) {
+                                    foundImage = true;
+                                    break;
+                                }
+                            }
+                            if (foundImage) break;
+                        }
+                    }
+                } else {
+                    const pText = (pageTextMap[matchedPage] || '').toLowerCase();
+                    if (terms.some(t => t.length >= 3 && pText.includes(t.toLowerCase()))) {
+                        foundImage = true;
+                    }
+                }
+            }
+
+            if (foundImage) {
+                imageIndices.push(item.index);
+            }
+        } catch (e) {
+            console.warn('[checkAndFilterLiImages] error evaluating item ' + item.index, e);
+        }
+    }
+
+    if (pagesWithImages.size > 0 && imageIndices.length === 0) {
+        items.forEach(it => imageIndices.push(it.index));
+    }
+
+    console.log('[checkAndFilterLiImages] result indices:', imageIndices);
+    geminiWebview.executeJavaScript(`window.applyLiImageFilter && window.applyLiImageFilter(${JSON.stringify(imageIndices)})`).catch(() => {});
 }
 
 function clusterMatches(matches) {
@@ -1615,16 +1806,47 @@ async function highlightContextInPDF(rawPayload) {
 
         let expanded;
         if (bestImageBlock) {
-            // ภาพประกอบเป็นเป้าหมายหลัก: วงเฉพาะภาพ + ขอบเล็กน้อย
-            expanded = clampRegionToCanvas({
-                x: bestImageBlock.x - 18,
-                y: bestImageBlock.y - 18,
-                w: bestImageBlock.w + 36,
-                h: bestImageBlock.h + 36
-            }, bestPageViewport.width, bestPageViewport.height);
-            console.log('[Smart Crop] Image-first: found image block', Math.round(bestImageBlock.w) + 'x' + Math.round(bestImageBlock.h));
+            // เลือกภาพเฉพาะส่วนที่ <li> นั้นกำลังอ่านสรุปอยู่
+            // ถ้าภาพเป็นผัง/ไดอะแกรมรวมขนาดใหญ่ ให้เจาะจงเฉพาะส่วนที่สัมพันธ์กับ regionToDraw (จุดที่พบข้อความ/หัวข้อของ li)
+            if (regionToDraw) {
+                const padX = Math.max(140, Math.min(bestImageBlock.w * 0.45, regionToDraw.w * 1.6));
+                const padY = Math.max(110, Math.min(bestImageBlock.h * 0.45, regionToDraw.h * 2.8));
+
+                const subX = Math.max(bestImageBlock.x - 14, regionToDraw.x - padX);
+                const subY = Math.max(bestImageBlock.y - 14, regionToDraw.y - padY);
+                const subRight = Math.min(bestImageBlock.x + bestImageBlock.w + 14, regionToDraw.x + regionToDraw.w + padX);
+                const subBottom = Math.min(bestImageBlock.y + bestImageBlock.h + 14, regionToDraw.y + regionToDraw.h + padY);
+
+                const subW = Math.max(220, subRight - subX);
+                const subH = Math.max(160, subBottom - subY);
+
+                // หากภาพใหญ่กว่าพื้นที่โฟกัส ให้เจาะจงเฉพาะส่วนที่เกี่ยวข้องกับ li
+                if (bestImageBlock.w > subW * 1.25 || bestImageBlock.h > subH * 1.25) {
+                    expanded = clampRegionToCanvas({
+                        x: subX,
+                        y: subY,
+                        w: Math.min(bestImageBlock.w, subW),
+                        h: Math.min(bestImageBlock.h, subH)
+                    }, bestPageViewport.width, bestPageViewport.height);
+                    console.log('[Smart Crop] Specific illustration part for this <li>:', Math.round(expanded.w) + 'x' + Math.round(expanded.h));
+                } else {
+                    const union = createUnionRect([bestImageBlock, regionToDraw]) || bestImageBlock;
+                    expanded = clampRegionToCanvas({
+                        x: union.x - 18,
+                        y: union.y - 18,
+                        w: union.w + 36,
+                        h: union.h + 36
+                    }, bestPageViewport.width, bestPageViewport.height);
+                }
+            } else {
+                expanded = clampRegionToCanvas({
+                    x: bestImageBlock.x - 18,
+                    y: bestImageBlock.y - 18,
+                    w: bestImageBlock.w + 36,
+                    h: bestImageBlock.h + 36
+                }, bestPageViewport.width, bestPageViewport.height);
+            }
         } else {
-            // ไม่มีภาพจริงหลัง retry ทั้งหมด: ดึงย่อหน้าบริบทในคอลัมน์เดียวกัน
             expanded = await buildArticleContextRegion(bestPageNum, regionToDraw, bestPageViewport);
             console.log('[Smart Crop] no verified illustration; using article-context fallback');
         }
@@ -1642,17 +1864,14 @@ async function highlightContextInPDF(rawPayload) {
         const wrapper = document.getElementById(`page-wrapper-${bestPageNum}`);
         let finalCanvas = wrapper ? wrapper.querySelector('canvas') : null;
 
-        // โฟกัสพุ่งเข้าหาภาพประกอบเป็นอันดับแรก (Priority 1: Image block center)
-        var focusTargetCenter = bestImageBlock ? {
-            x: bestImageBlock.x + bestImageBlock.w / 2,
-            y: bestImageBlock.y + bestImageBlock.h / 2
-        } : (expanded ? {
+        // โฟกัสพุ่งเข้าหาจุดกึ่งกลางของภาพส่วนที่เลือกโดยตรง
+        var focusTargetCenter = expanded ? {
             x: expanded.x + expanded.w / 2,
             y: expanded.y + expanded.h / 2
         } : {
             x: regionToDraw.x + regionToDraw.w / 2,
             y: regionToDraw.y + regionToDraw.h / 2
-        });
+        };
 
         // Auto-zoom: คำนวณ zoom ให้ expanded region fit viewport ได้สมดุลพอดี
         let zoomRatio = 1;
@@ -1776,14 +1995,24 @@ async function highlightContextInPDF(rawPayload) {
                         var targetScrollTop = cont.scrollTop + (contentCtrY - contCenterY);
                         var targetScrollLeft = cont.scrollLeft + (contentCtrX - contCenterX);
 
-                        cont.scrollTo({
-                            top: Math.max(0, targetScrollTop),
-                            left: Math.max(0, targetScrollLeft),
-                            behavior: 'smooth'
-                        });
+                        const performPdfScroll = () => {
+                            try {
+                                cont.scrollTo({
+                                    top: Math.max(0, targetScrollTop),
+                                    left: Math.max(0, targetScrollLeft),
+                                    behavior: 'smooth'
+                                });
+                                setTimeout(() => { syncOverlayToViewport(); }, 350);
+                            } catch (_) {}
+                        };
 
-                        // Re-calculate viewport หลัง scroll เสร็จ
-                        setTimeout(() => { syncOverlayToViewport(); }, 350);
+                        // ถ้าเสียง TTS กำลังโหลด ให้รอจนกว่าเสียงจะโหลดเสร็จค่อย scroll
+                        if (window.__ttsLoadingAudio) {
+                            window.executeDeferredPdfScroll = performPdfScroll;
+                            console.log('[PDF] Scroll deferred: waiting for TTS audio to load...');
+                        } else {
+                            performPdfScroll();
+                        }
                     } catch (e) {
                         try { overlay.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) { }
                     }
@@ -1791,7 +2020,8 @@ async function highlightContextInPDF(rawPayload) {
             });
         }
 
-        return { pageNum: bestPageNum, region: window.lastHighlightRegion };
+        syncOverlayFlagToWebview(!!bestImageBlock);
+        return { pageNum: bestPageNum, region: window.lastHighlightRegion, hasImage: !!bestImageBlock };
 
     } catch (err) {
         console.error('[PDF] Smart context highlight failed, falling back:', err);
@@ -2199,6 +2429,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             // Initialize Reading State
             window.readingComplete = true;
             window.__hasOverlay__ = true;
+            if (window.__isPrefetchWebview === undefined) window.__isPrefetchWebview = false;
             
             if (!window.chrome) window.chrome = {};
             
@@ -2224,9 +2455,21 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     .active-focus .copy-btn-container { opacity: 1 !important; }
                     .focus-response-container li.active-focus .li-save-btn { opacity: 0.8 !important; }
                     .focus-response-container li .li-save-btn:hover { opacity: 1 !important; background: rgba(249,115,22,0.18) !important; border-color: rgba(249,115,22,0.5) !important; }
-                    .focus-response-container li.tts-speaking-li { border-left: 3px solid #22c55e !important; background: rgba(34, 197, 94, 0.06) !important; }
+                    .focus-response-container li.tts-speaking-li { border-left: 3px solid #22c55e !important; background: rgba(34, 197, 94, 0.06) !important; position: relative !important; }
                     .focus-response-container li .tts-ch-active { background: rgba(34, 197, 94, 0.4) !important; border-radius: 3px !important; color: #fff !important; text-shadow: 0 0 8px rgba(34,197,94,0.5) !important; }
                     .focus-response-container li .tts-ch { transition: background 0.15s ease, color 0.15s ease; }
+
+                    .tts-progress-track { position: absolute; bottom: 0; left: 0; right: 0; height: 5px; background: rgba(15, 23, 42, 0.7); overflow: hidden; z-index: 1000; pointer-events: none; border-radius: 0 0 10px 10px; transition: opacity 0.3s ease; }
+                    .tts-progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #10b981, #22c55e, #4ade80); box-shadow: 0 0 10px rgba(34, 197, 94, 0.9); transition: width 0.08s linear; border-radius: 2px; }
+                    .tts-progress-loading { height: 5px !important; }
+                    .tts-progress-loading .tts-progress-fill { width: 100% !important; background: linear-gradient(90deg, rgba(34,197,94,0.1) 0%, rgba(34,197,94,0.95) 50%, rgba(56,189,248,0.95) 75%, rgba(34,197,94,0.1) 100%) !important; background-size: 200% 100% !important; animation: ttsLoadingShimmer 0.9s infinite linear !important; box-shadow: 0 0 12px rgba(34, 197, 94, 0.9) !important; }
+
+                    #tts-global-progress { position: fixed; top: 0; left: 0; right: 0; height: 4px; z-index: 999999; pointer-events: none; opacity: 0; transition: opacity 0.25s ease; background: rgba(15, 23, 42, 0.4); }
+                    #tts-global-progress.active { opacity: 1; }
+                    #tts-global-progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #10b981, #22c55e, #38bdf8); box-shadow: 0 0 12px rgba(34, 197, 94, 0.95); transition: width 0.08s linear; }
+                    #tts-global-progress.loading #tts-global-progress-fill { width: 100% !important; background: linear-gradient(90deg, rgba(34,197,94,0.1) 0%, rgba(34,197,94,0.95) 50%, rgba(56,189,248,0.95) 75%, rgba(34,197,94,0.1) 100%) !important; background-size: 200% 100% !important; animation: ttsLoadingShimmer 0.9s infinite linear !important; }
+
+                    @keyframes ttsLoadingShimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
                 \`;
                 const style = document.createElement('style');
                 style.id = 'gemini-focus-styles';
@@ -2237,30 +2480,65 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             function tagThaiKeywords() {
                 var R = /[ก-๙]/;
                 document.querySelectorAll('message-content li, .model-response-text li, [data-test-id="model-response"] li').forEach(function(li) {
+                    // 1. Sanitize any double parens in text nodes
+                    var walker = document.createTreeWalker(li, NodeFilter.SHOW_TEXT, null, false);
+                    var textNode;
+                    while ((textNode = walker.nextNode())) {
+                        if (textNode.nodeValue && (textNode.nodeValue.indexOf('(') !== -1 || textNode.nodeValue.indexOf(')') !== -1)) {
+                            var val = textNode.nodeValue;
+                            while (val.indexOf('((') !== -1) val = val.replace('((', '(');
+                            while (val.indexOf('( (') !== -1) val = val.replace('( (', '(');
+                            while (val.indexOf('))') !== -1) val = val.replace('))', ')');
+                            while (val.indexOf(') )') !== -1) val = val.replace(') )', ')');
+                            while (val.indexOf('( ') !== -1) val = val.replace('( ', '(');
+                            while (val.indexOf(' )') !== -1) val = val.replace(' )', ')');
+                            textNode.nodeValue = val;
+                        }
+                    }
+
                     if (li._tk) return;
                     li._tk = true;
-                    // 1. <strong>/<b> ที่มี "คำไทย (อังกฤษ)"
-                    li.querySelectorAll('strong, b').forEach(function(b) {
-                        var t = (b.innerText || '').trim();
-                        if (t.length < 2) return;
-                        var pi = t.indexOf('(');
-                        if (pi > 0 && t.indexOf(')') > pi && R.test(t.substring(0, pi))) {
-                            var thai = t.substring(0, pi).trim();
-                            var eng = t.substring(pi);
-                            b.innerHTML = '<span class="thai-keyword" style="color:#fb923c !important;font-weight:700 !important">' + thai + '</span> ' + eng;
-                        } else if (R.test(t)) {
-                            b.style.cssText = b.style.cssText + ';color:#fb923c !important;font-weight:700 !important';
-                            b.classList.add('thai-keyword');
+
+                    // 2. Format <strong>/<b> at the title of li
+                    var strongs = li.querySelectorAll('strong, b');
+                    if (strongs.length > 0) {
+                        strongs.forEach(function(b) {
+                            var t = (b.innerText || '').trim();
+                            if (t.length < 2) return;
+                            var pi = t.indexOf('(');
+                            if (pi > 0 && t.indexOf(')') > pi && R.test(t.substring(0, pi))) {
+                                var thai = t.substring(0, pi).trim();
+                                var eng = t.substring(pi);
+                                while (eng.indexOf('((') !== -1) eng = eng.replace('((', '(');
+                                while (eng.indexOf('( (') !== -1) eng = eng.replace('( (', '(');
+                                while (eng.indexOf('))') !== -1) eng = eng.replace('))', ')');
+                                while (eng.indexOf(') )') !== -1) eng = eng.replace(') )', ')');
+                                b.innerHTML = '<span class="thai-keyword" style="color:#fb923c !important;font-weight:700 !important">' + thai + '</span> ' + eng;
+                            } else if (R.test(t)) {
+                                b.style.cssText = b.style.cssText + ';color:#fb923c !important;font-weight:700 !important';
+                                b.classList.add('thai-keyword');
+                            }
+                        });
+                    } else {
+                        // Fallback: If no <strong> tag exists, only style the leading title
+                        var firstChild = li.firstChild;
+                        if (firstChild && firstChild.nodeType === 3) {
+                            var txt = firstChild.nodeValue || '';
+                            var pi = txt.indexOf('(');
+                            var pj = txt.indexOf(')');
+                            if (pi > 0 && pj > pi && R.test(txt.substring(0, pi))) {
+                                var thai = txt.substring(0, pi).trim();
+                                var eng = txt.substring(pi);
+                                var span = document.createElement('span');
+                                span.className = 'thai-keyword';
+                                span.style.cssText = 'color:#fb923c !important;font-weight:700 !important';
+                                span.textContent = thai;
+                                var rest = document.createTextNode(' ' + eng);
+                                li.replaceChild(rest, firstChild);
+                                li.insertBefore(span, rest);
+                            }
                         }
-                    });
-                    // 2. ข้อความธรรมดา "คำไทย (อังกฤษ)" ใช้ innerHTML replace
-                    var html = li.innerHTML;
-                    if (!html.includes('(') || !R.test(html)) return;
-                    li.innerHTML = html.replace(/([\u0E00-\u0E7F][\u0E00-\u0E7F\s]*)\(([^)]+)\)/g, function(m, a, b) {
-                        a = a.trim();
-                        if (!R.test(a)) return m;
-                        return '<span class="thai-keyword" style="color:#fb923c !important;font-weight:700 !important">' + a + '</span> (' + b + ')';
-                    });
+                    }
                 });
             }
 
@@ -2306,12 +2584,24 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                  }
             }
 
+            function getVisibleLis(c) {
+                var root = c;
+                if (!root) {
+                    var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
+                    if (resp.length === 0) return [];
+                    root = resp[resp.length - 1];
+                }
+                return Array.from(root.querySelectorAll('li')).filter(function(l) {
+                    return l.innerText.trim().length > 5 && l.style.display !== 'none';
+                });
+            }
+
             function setupFocusMode() {
                 addFocusStyles();
                 const responses = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
                 if (responses.length === 0) return;
                 const container = responses[responses.length - 1];
-                var items = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
+                var items = getVisibleLis(container);
                 if (container.dataset.focusInitialized !== 'true') {
                     if (items.length === 0) return;
                     container.dataset.focusInitialized = 'true';
@@ -2319,9 +2609,16 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     container.dataset.focusIndex = '0';
                     items[0].classList.add('active-focus');
                     triggerHighlight(items[0]);
-                    setTimeout(function() { items[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 100);
+                    if (window.__ebookOfflineMode || !window.__ttsEnabled) {
+                        setTimeout(function() { items[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 100);
+                    }
+                    if (!window.__ebookOfflineMode && !window.__isPrefetchWebview) {
+                        speakLi(items[0]);
+                    } else if (typeof triggerFastFirstLiRead === 'function') {
+                        triggerFastFirstLiRead(items[0]);
+                    }
                     container.addEventListener('wheel', function(e) {
-                        var currentItems = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
+                        var currentItems = getVisibleLis(container);
                         if (currentItems.length === 0) return;
                         var idx = parseInt(container.dataset.focusIndex || '0');
                         if (e.deltaY > 0) {
@@ -2329,7 +2626,16 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                             else if (window.__ebookOfflineMode) { console.log('__OFFLINE_LAST_LI_WHEEL__'); }
                         }
                         else { if (idx > 0) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx--; updateFocus(idx); } }
-                        function updateFocus(idx) { currentItems[idx].classList.add('active-focus'); currentItems[idx].scrollIntoView({ behavior: 'smooth', block: 'center' }); triggerHighlight(currentItems[idx]); container.dataset.focusIndex = idx.toString(); setTimeout(tagThaiKeywords, 50); speakLi(currentItems[idx]); }
+                        function updateFocus(idx) {
+                            currentItems[idx].classList.add('active-focus');
+                            if (window.__ebookOfflineMode || !window.__ttsEnabled) {
+                                currentItems[idx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            }
+                            triggerHighlight(currentItems[idx]);
+                            container.dataset.focusIndex = idx.toString();
+                            setTimeout(tagThaiKeywords, 50);
+                            speakLi(currentItems[idx]);
+                        }
                     }, { passive: false });
                 } else if (items.length > 0) {
                     container.querySelectorAll('li').forEach(function(li) { attachSaveBtnToLi(li); });
@@ -2338,8 +2644,14 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     if (!items[syncIdx].classList.contains('active-focus')) {
                         items[syncIdx].classList.add('active-focus');
                         triggerHighlight(items[syncIdx]);
+                        if (!window.__ebookOfflineMode && !window.__isPrefetchWebview && !ttsState.speakingLi) {
+                            speakLi(items[syncIdx]);
+                        }
+                    } else if (!window.__ebookOfflineMode && !window.__isPrefetchWebview && !ttsState.speakingLi) {
+                        speakLi(items[syncIdx]);
                     }
                 }
+                if (typeof requestLiImageCheck === 'function') requestLiImageCheck();
             }
 
             function loadKaTeX() {
@@ -2383,9 +2695,21 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
             window.updateSaveButtons = function(hasOverlay) {
                 window.__hasOverlay__ = !!hasOverlay;
-                document.querySelectorAll('.li-save-btn').forEach(function(b) {
-                    if (b.textContent !== '⌛' && !b.textContent.includes('✓')) {
-                        b.textContent = window.__hasOverlay__ ? '💾🖼️' : '💾';
+                var allLis = document.querySelectorAll('message-content li, .model-response-text li, [data-test-id="model-response"] li');
+                
+                if (window.__hasOverlay__) {
+                    allLis.forEach(function(li) {
+                        li.dataset.hasImage = 'true';
+                    });
+                }
+
+                allLis.forEach(function(li) {
+                    li.style.display = '';
+                    var btn = li.querySelector('.li-save-btn');
+                    if (!btn) return;
+                    var hasImg = window.__hasOverlay__ || (li.dataset.hasImage === 'true');
+                    if (!btn.textContent.includes('✓') && btn.textContent !== '⏳') {
+                        btn.textContent = hasImg ? '🖼️' : '💾';
                     }
                 });
             };
@@ -2398,7 +2722,9 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
                 var btn = document.createElement('button');
                 btn.className = 'li-save-btn';
-                btn.textContent = window.__hasOverlay__ ? '💾🖼️' : '💾';
+                var isActInit = li.classList.contains('active-focus');
+                var hasImgInit = isActInit ? (window.__hasOverlay__ || li.dataset.hasImage === 'true') : (li.dataset.hasImage === 'true');
+                btn.textContent = hasImgInit ? '🖼️' : '💾';
                 btn.title = 'บันทึกลง Bigdata';
                 btn.style.cssText = [
                     'display:inline-flex',
@@ -2425,7 +2751,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 function moveToNextLi() {
                     var c = li.closest('message-content, .model-response-text, [data-test-id="model-response"]');
                     if (!c) { console.log('__OFFLINE_SEQUENCE_END__'); console.log('__NEXT_PAGE__'); return; }
-                    var items = Array.from(c.querySelectorAll('li')).filter(function(li) { return li.innerText.trim().length > 5; });
+                    var items = getVisibleLis(c);
                     var idx = items.indexOf(li);
                     if (idx === -1 || idx >= items.length - 1) {
                         console.log('__OFFLINE_SEQUENCE_END__');
@@ -2463,9 +2789,6 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
                 btn.onmouseenter = function() {
                     if (btn.disabled) return;
-                    // หลังบันทึก ระบบเลื่อน focus ไป <li> ถัดไปใต้เมาส์พอดี
-                    // ต้องบังคับให้ผู้ใช้เลื่อนเมาส์ออกก่อน 1 ครั้ง จึงจะเริ่ม auto-save ได้
-                    // ป้องกันการกด Save ของ <li> ถัดไปโดยไม่ตั้งใจ
                     if (btn._posLocked) {
                         btn.style.opacity = '0.7';
                         return;
@@ -2473,19 +2796,24 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     if (btn._hoverLocked) return;
                     btn.style.opacity = '1';
                     btn.style.transform = 'scale(1.15)';
-                    btn.textContent = window.__hasOverlay__ ? '💾🖼️' : '💾';
+                    if (btn.textContent !== '⏳' && !btn.textContent.includes('✓')) {
+                        var isAct = li.classList.contains('active-focus');
+                        var hasImg = isAct ? (window.__hasOverlay__ || li.dataset.hasImage === 'true') : (li.dataset.hasImage === 'true');
+                        btn.textContent = hasImg ? '🖼️' : '💾';
+                    }
                     autoTimer = setTimeout(function() { btn.click(); }, 1800);
                 };
                 btn.onmouseleave = function() {
                     btn.style.transform = 'scale(1)';
                     if (btn._posLocked) {
-                        // ปลดล็อกเฉพาะหลัง pointer ออกจริง จากนั้น hover รอบใหม่จึงกดได้
                         btn._posLocked = false;
                         btn._hoverLocked = false;
                     }
-                    if (!btn.disabled) {
+                    if (!btn.disabled && btn.textContent !== '⏳' && !btn.textContent.includes('✓')) {
                         btn.style.opacity = '0.25';
-                        btn.textContent = window.__hasOverlay__ ? '💾🖼️' : '💾';
+                        var isAct = li.classList.contains('active-focus');
+                        var hasImg = isAct ? (window.__hasOverlay__ || li.dataset.hasImage === 'true') : (li.dataset.hasImage === 'true');
+                        btn.textContent = hasImg ? '🖼️' : '💾';
                     }
                     if (autoTimer) { clearTimeout(autoTimer); autoTimer = null; }
                 };
@@ -2501,7 +2829,9 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     });
                     var saveText = temp.innerText.trim().replace(/\[Image:[^\]]*\]/g, '').trim();
 
-                    if (window.__hasOverlay__) {
+                    var isAct = li.classList.contains('active-focus');
+                    var hasImg = isAct ? (window.__hasOverlay__ || li.dataset.hasImage === 'true') : (li.dataset.hasImage === 'true');
+                    if (hasImg) {
                         console.log('__SCREENSHOT_SAVE__:' + saveText);
                     } else {
                         console.log('__GITHUB_SAVE__:' + saveText);
@@ -2522,7 +2852,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     if (e.target.closest('.li-save-btn, .copy-btn-container, button, a')) return;
                     var c = li.closest('message-content, .model-response-text, [data-test-id="model-response"]');
                     if (c) {
-                        var items = Array.from(c.querySelectorAll('li')).filter(function(li) { return li.innerText.trim().length > 5; });
+                        var items = getVisibleLis(c);
                         items.forEach(function(item) { item.classList.remove('active-focus'); });
                         li.classList.add('active-focus');
                         if (c.dataset.focusIndex !== undefined) c.dataset.focusIndex = items.indexOf(li).toString();
@@ -2546,6 +2876,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
             function ttsStop() {
                 if (window.__ttsStop) window.__ttsStop();
+                removeTtsProgressBar();
                 console.log('__TTS_STOP_EDGE__');
                 if (ttsState.speakingLi) {
                     var li = ttsState.speakingLi;
@@ -2553,6 +2884,104 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     li.classList.remove('tts-speaking-li');
                 }
                 ttsState.speakingLi = null;
+            }
+
+            function showTtsProgressBar(li) {
+                removeTtsProgressBar();
+                if (li) {
+                    var track = document.createElement('div');
+                    track.className = 'tts-progress-track tts-progress-loading';
+                    var fill = document.createElement('div');
+                    fill.className = 'tts-progress-fill';
+                    track.appendChild(fill);
+                    li.appendChild(track);
+                }
+                var globalBar = document.getElementById('tts-global-progress');
+                if (!globalBar) {
+                    globalBar = document.createElement('div');
+                    globalBar.id = 'tts-global-progress';
+                    var gFill = document.createElement('div');
+                    gFill.id = 'tts-global-progress-fill';
+                    globalBar.appendChild(gFill);
+                    document.body.appendChild(globalBar);
+                }
+                globalBar.className = 'active loading';
+                var gf = document.getElementById('tts-global-progress-fill');
+                if (gf) gf.style.width = '100%';
+            }
+
+            function updateTtsProgress(ratio) {
+                var pct = Math.min(Math.max(ratio * 100, 0), 100) + '%';
+                var track = document.querySelector('.tts-progress-track');
+                if (track) {
+                    track.classList.remove('tts-progress-loading');
+                    var fill = track.querySelector('.tts-progress-fill');
+                    if (fill) fill.style.width = pct;
+                }
+                var globalBar = document.getElementById('tts-global-progress');
+                if (globalBar) {
+                    globalBar.classList.remove('loading');
+                    globalBar.classList.add('active');
+                    var gf = document.getElementById('tts-global-progress-fill');
+                    if (gf) gf.style.width = pct;
+                }
+            }
+
+            function removeTtsProgressBar() {
+                var tracks = document.querySelectorAll('.tts-progress-track');
+                tracks.forEach(function(t) {
+                    t.style.opacity = '0';
+                    setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 300);
+                });
+                var globalBar = document.getElementById('tts-global-progress');
+                if (globalBar) {
+                    globalBar.classList.remove('active', 'loading');
+                    var gf = document.getElementById('tts-global-progress-fill');
+                    if (gf) gf.style.width = '0%';
+                }
+            }
+
+            function speakNatural(li) {
+                if (window.__ebookOfflineMode) return;
+                var fullText = li.innerText || '';
+                var thaiText = ttsExtractThai(fullText);
+                if (!thaiText) return;
+                ttsState.speakingLi = li;
+                li.classList.add('tts-speaking-li');
+                ttsSegmentAndWrap(li);
+                showTtsProgressBar(li);
+                console.log('__TTS_EDGE__:' + thaiText);
+                ttsPrefetchNeighbors(li);
+                window.__ttsStart = function(duration) {
+                    if (ttsState.speakingLi) {
+                        try { ttsState.speakingLi.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) {}
+                    }
+                    window.__ttsChars = Array.from(document.querySelectorAll('.tts-ch'));
+                    window.__ttsStartTime = Date.now();
+                    window.__ttsDuration = duration;
+                    function tick() {
+                        var elapsed = (Date.now() - window.__ttsStartTime) / 1000;
+                        var ratio = Math.min(elapsed / window.__ttsDuration, 1);
+                        var idx = Math.floor(ratio * window.__ttsChars.length);
+                        document.querySelectorAll('.tts-ch-active').forEach(function(s) { s.classList.remove('tts-ch-active'); });
+                        if (idx >= 0 && idx < window.__ttsChars.length) {
+                            window.__ttsChars[idx].classList.add('tts-ch-active');
+                        }
+                        updateTtsProgress(ratio);
+                        if (ratio < 1) {
+                            window.__ttsTimer = setTimeout(tick, 50);
+                        } else {
+                            setTimeout(removeTtsProgressBar, 300);
+                        }
+                    }
+                    tick();
+                };
+                window.__ttsStop = function() {
+                    if (window.__ttsTimer) { clearTimeout(window.__ttsTimer); window.__ttsTimer = null; }
+                    window.__ttsChars = [];
+                    document.querySelectorAll('.tts-ch-active').forEach(function(s) { s.classList.remove('tts-ch-active'); });
+                    removeTtsProgressBar();
+                };
             }
 
             function ttsExtractThai(text) {
@@ -2634,7 +3063,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             function ttsPrefetchNeighbors(li) {
                 var container = li.closest('message-content, .model-response-text, [data-test-id="model-response"]');
                 if (!container) return;
-                var items = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
+                var items = getVisibleLis(container);
                 var idx = items.indexOf(li);
                 if (idx < 0) return;
                 for (var d = -2; d <= 2; d++) {
@@ -2647,40 +3076,6 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 }
             }
 
-            function speakNatural(li) {
-                if (window.__ebookOfflineMode) return;
-                var fullText = li.innerText || '';
-                var thaiText = ttsExtractThai(fullText);
-                if (!thaiText) return;
-                ttsState.speakingLi = li;
-                li.classList.add('tts-speaking-li');
-                ttsSegmentAndWrap(li);
-                console.log('__TTS_EDGE__:' + thaiText);
-                ttsPrefetchNeighbors(li);
-                window.__ttsStart = function(duration) {
-                    window.__ttsChars = Array.from(document.querySelectorAll('.tts-ch'));
-                    window.__ttsStartTime = Date.now();
-                    window.__ttsDuration = duration;
-                    function tick() {
-                        var elapsed = (Date.now() - window.__ttsStartTime) / 1000;
-                        var ratio = Math.min(elapsed / window.__ttsDuration, 1);
-                        var idx = Math.floor(ratio * window.__ttsChars.length);
-                        document.querySelectorAll('.tts-ch-active').forEach(function(s) { s.classList.remove('tts-ch-active'); });
-                        if (idx >= 0 && idx < window.__ttsChars.length) {
-                            window.__ttsChars[idx].classList.add('tts-ch-active');
-                        }
-                        if (ratio < 1) {
-                            window.__ttsTimer = setTimeout(tick, 50);
-                        }
-                    }
-                    tick();
-                };
-                window.__ttsStop = function() {
-                    if (window.__ttsTimer) { clearTimeout(window.__ttsTimer); window.__ttsTimer = null; }
-                    window.__ttsChars = [];
-                    document.querySelectorAll('.tts-ch-active').forEach(function(s) { s.classList.remove('tts-ch-active'); });
-                };
-            }
 
             function speakLi(li, waitForReady) {
                 ttsStop();
@@ -2705,7 +3100,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 var container = document.querySelector('message-content.focus-response-container, .model-response-text.focus-response-container, [data-test-id="model-response"].focus-response-container');
                 if (!container) { setupFocusMode(); container = document.querySelector('.focus-response-container'); }
                 if (!container) return;
-                var items = Array.from(container.querySelectorAll('li')).filter(function(li) { return li.innerText.trim().length > 5; });
+                var items = getVisibleLis(container);
                 if (!items.length) return;
                 var idx = parseInt(container.dataset.focusIndex || '0');
                 if (idx < 0 || idx >= items.length) idx = Math.max(0, items.findIndex(function(li) { return li.classList.contains('active-focus'); }));
@@ -2835,7 +3230,12 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     if (bestBtn) {
                         var bestText = getBtnText(bestBtn).slice(0,80);
                         console.log('clickSend: best score=' + bestScore, bestText, 'disabled=' + bestBtn.disabled);
-                        if (!bestBtn.disabled) { console.log('clickSend: CLICKED'); bestBtn.click(); return "CLICKED"; }
+                        if (!bestBtn.disabled) {
+                            console.log('clickSend: CLICKED');
+                            if (window.resetAutoReadState) window.resetAutoReadState();
+                            bestBtn.click();
+                            return "CLICKED";
+                        }
                         console.log('clickSend: bestBtn is DISABLED, returning WAITING');
                         return "WAITING"; // send button ยัง disabled (กำลังประมวลผล)
                     }
@@ -2855,7 +3255,11 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                                 if (!sb.disabled && !foundReady) foundReady = sb;
                                 if (sb.disabled && !foundDisabled) foundDisabled = sb;
                             }
-                            if (foundReady) { foundReady.click(); return "CLICKED"; }
+                            if (foundReady) {
+                                if (window.resetAutoReadState) window.resetAutoReadState();
+                                foundReady.click();
+                                return "CLICKED";
+                            }
                             if (foundDisabled) return "WAITING"; // มีปุ่มแต่ disabled
                         }
                         closestParent = closestParent.parentElement;
@@ -2943,12 +3347,25 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                            window.nextPageTriggered = false;
                            autoReadDone = false;
                        }
+                       if (!autoReadDone) {
+                           triggerFastFirstLiRead();
+                       }
                   } 
                    else { 
                        if(window.lastStatus !== 'DONE') { 
                            console.log('__GEMINI_DONE__'); 
                            window.lastStatus = 'DONE'; 
-                           autoReadFirstLi();
+                           requestLiImageCheck();
+                           var currentVisible = getVisibleLis();
+                           if (currentVisible.length > 0 && !ttsState.speakingLi && !window.__ebookOfflineMode && !window.__isPrefetchWebview) {
+                               var targetLi = currentVisible[0];
+                               currentVisible.forEach(function(l) { l.classList.remove('active-focus'); });
+                               targetLi.classList.add('active-focus');
+                               triggerHighlight(targetLi);
+                               speakLi(targetLi);
+                           } else if (!autoReadDone) {
+                               triggerFastFirstLiRead();
+                           }
                        } 
                    }
                } catch(e){}
@@ -2959,30 +3376,89 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             }
 
             var autoReadDone = false;
-            var autoReadRetries = 0;
-            function autoReadFirstLi() {
-                if (autoReadDone) return;
+            var autoReadTimer = null;
+            var checkImagesDebounce = null;
+
+            function requestLiImageCheck() {
+                if (checkImagesDebounce) clearTimeout(checkImagesDebounce);
+                checkImagesDebounce = setTimeout(function() {
+                    var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
+                    if (resp.length === 0) return;
+                    var container = resp[resp.length - 1];
+                    var allLis = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
+                    if (allLis.length === 0) return;
+                    var payload = allLis.map(function(l, i) { return { index: i, text: l.innerText.trim() }; });
+                    console.log('__CHECK_LI_IMAGES__:' + JSON.stringify(payload));
+                }, 150);
+            }
+
+            window.applyLiImageFilter = function(imageIndices) {
                 var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
                 if (resp.length === 0) return;
-                var c = resp[resp.length - 1];
-                var items = Array.from(c.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
-                if (items.length === 0) {
-                    if (autoReadRetries < 30) {
-                        autoReadRetries++;
-                        setTimeout(autoReadFirstLi, 100);
+                var container = resp[resp.length - 1];
+                var allLis = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
+                if (allLis.length === 0) return;
+
+                var anyImg = (Array.isArray(imageIndices) && imageIndices.length > 0) || window.__hasOverlay__ || allLis.some(function(l) { return l.dataset.hasImage === 'true'; });
+
+                allLis.forEach(function(li, idx) {
+                    var hasImg = anyImg || (Array.isArray(imageIndices) && imageIndices.includes(idx)) || li.dataset.hasImage === 'true';
+                    li.style.display = '';
+                    if (hasImg) li.dataset.hasImage = 'true';
+                    var btn = li.querySelector('.li-save-btn');
+                    if (btn && !btn.textContent.includes('✓') && btn.textContent !== '⏳') {
+                        btn.textContent = hasImg ? '🖼️' : '💾';
                     }
-                    return;
+                });
+
+                var visibleLis = getVisibleLis(container);
+                if (visibleLis.length > 0) {
+                    var activeItem = visibleLis.find(function(l) { return l.classList.contains('active-focus'); });
+                    if (!activeItem) {
+                        visibleLis.forEach(function(l) { l.classList.remove('active-focus'); });
+                        visibleLis[0].classList.add('active-focus');
+                        container.dataset.focusIndex = '0';
+                        triggerHighlight(visibleLis[0]);
+                        setTimeout(function() { visibleLis[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 50);
+                        activeItem = visibleLis[0];
+                    }
+                    triggerFastFirstLiRead(activeItem);
                 }
-                if (window.lastStatus !== 'DONE') {
-                    setTimeout(autoReadFirstLi, 100);
-                    return;
+            };
+
+            window.resetAutoReadState = function() {
+                autoReadDone = false;
+                if (autoReadTimer) { clearTimeout(autoReadTimer); autoReadTimer = null; }
+                ttsStop();
+            };
+
+            function triggerFastFirstLiRead(preferredLi) {
+                if (window.__ebookOfflineMode || window.__isPrefetchWebview) return;
+                var visible = getVisibleLis();
+                if (visible.length === 0) return;
+
+                var target = preferredLi || visible[0];
+                if (!target) return;
+
+                var rawText = (target.innerText || '').trim();
+                if (visible.length >= 2 || rawText.length >= 12) {
+                    if (ttsState.speakingLi === target) return;
+                    autoReadDone = true;
+                    if (autoReadTimer) { clearTimeout(autoReadTimer); autoReadTimer = null; }
+                    visible.forEach(function(l) { l.classList.remove('active-focus'); });
+                    target.classList.add('active-focus');
+                    triggerHighlight(target);
+                    speakLi(target);
+                } else if (!autoReadTimer) {
+                    autoReadTimer = setTimeout(function() {
+                        autoReadTimer = null;
+                        triggerFastFirstLiRead();
+                    }, 80);
                 }
-                autoReadDone = true;
-                autoReadRetries = 0;
-                items[0].classList.add('active-focus');
-                triggerHighlight(items[0]);
-                setTimeout(function() { items[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 50);
-                setTimeout(function() { speakLi(items[0]); }, 100);
+            }
+
+            function autoReadFirstLi() {
+                triggerFastFirstLiRead();
             }
 
             // Init
@@ -3001,6 +3477,8 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 if (!li.querySelector('.li-save-btn')) {
                     attachSaveBtnToLi(li);
                 }
+                requestLiImageCheck();
+                triggerFastFirstLiRead();
                 // Lets the host resume automatic page advance only after a paused
                 // response has genuinely regained a list item.
                 if (window.lastStatus === 'DONE' && li.innerText.trim().length > 12) {
@@ -3011,6 +3489,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             function observeResponseContainer(container) {
                 if (observedContainers.has(container)) return;
                 observedContainers.add(container);
+                autoReadDone = false;
 
                 // attach ปุ่มให้ li ที่มีอยู่แล้ว
                 container.querySelectorAll('li').forEach(onNewLi);
@@ -3217,8 +3696,90 @@ async function loadPDFFromFile(file) {
     }
 }
 
-// --- Layout Analysis: detect text/illustration blocks from rendered PDF canvas ---
+// --- Layout Analysis: detect text/illustration blocks from rendered PDF canvas & PDF objects ---
 let pageLayoutBlocks = {};
+
+// สกัดพิกัดรูปภาพจริง (Embedded Image Objects / XObjects) โดยตรงจาก bytecode ของหน้า PDF ผ่าน PDF.js
+async function extractPdfImageObjects(page, viewport) {
+    const images = [];
+    if (!page || !page.getOperatorList) return images;
+    try {
+        const opList = await page.getOperatorList();
+        const fnArray = opList.fnArray;
+        const argsArray = opList.argsArray;
+        const OPS = (typeof pdfjsLib !== 'undefined' && pdfjsLib && pdfjsLib.OPS) ? pdfjsLib.OPS : (window.pdfjsLib ? window.pdfjsLib.OPS : null);
+        if (!OPS) return images;
+
+        const transformStack = [];
+        let currentTransform = [1, 0, 0, 1, 0, 0];
+
+        for (let i = 0; i < fnArray.length; i++) {
+            const fn = fnArray[i];
+            const args = argsArray[i];
+
+            if (fn === OPS.save) {
+                transformStack.push([...currentTransform]);
+            } else if (fn === OPS.restore) {
+                if (transformStack.length > 0) {
+                    currentTransform = transformStack.pop();
+                }
+            } else if (fn === OPS.transform) {
+                if (Array.isArray(args) && args.length >= 6) {
+                    const [a1, b1, c1, d1, e1, f1] = currentTransform;
+                    const [a2, b2, c2, d2, e2, f2] = args;
+                    currentTransform = [
+                        a1 * a2 + c1 * b2,
+                        b1 * a2 + d1 * b2,
+                        a1 * c2 + c1 * d2,
+                        b1 * c2 + d1 * d2,
+                        a1 * e2 + c1 * f2 + e1,
+                        b1 * e2 + d1 * f2 + f1
+                    ];
+                }
+            } else if (
+                fn === OPS.paintImageXObject ||
+                fn === OPS.paintInlineImageXObject ||
+                fn === OPS.paintImageMaskXObject ||
+                fn === OPS.paintSolidColorImageMask
+            ) {
+                const [a, b, c, d, e, f] = currentTransform;
+                const p1 = viewport.convertToViewportPoint(e, f);
+                const p2 = viewport.convertToViewportPoint(a + e, b + f);
+                const p3 = viewport.convertToViewportPoint(c + e, d + f);
+                const p4 = viewport.convertToViewportPoint(a + c + e, b + d + f);
+                const xs = [p1[0], p2[0], p3[0], p4[0]];
+                const ys = [p1[1], p2[1], p3[1], p4[1]];
+                const minX = Math.min(...xs);
+                const maxX = Math.max(...xs);
+                const minY = Math.min(...ys);
+                const maxY = Math.max(...ys);
+                const iw = maxX - minX;
+                const ih = maxY - minY;
+
+                const vpArea = viewport.width * viewport.height;
+                const imgArea = iw * ih;
+                // กรองเฉพาะรูปภาพที่มีขนาดสมเหตุสมผล (ไม่เอาไอคอนเล็กจิ๋ว หรือพื้นหลังเต็มหน้า)
+                if (iw >= 25 && ih >= 25 && imgArea >= 800 && imgArea < vpArea * 0.94) {
+                    images.push({
+                        x: minX,
+                        y: minY,
+                        w: iw,
+                        h: ih,
+                        kind: 'image',
+                        source: 'pdf-object',
+                        isExactImage: true,
+                        textCoverage: 0,
+                        textItemCount: 0,
+                        areaFraction: imgArea / vpArea
+                    });
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('[extractPdfImageObjects] error:', e);
+    }
+    return images;
+}
 
 async function analyzePageLayout(canvas, page, pageNum) {
     if (!canvas) return;
@@ -3509,34 +4070,34 @@ async function analyzePageLayout(canvas, page, pageNum) {
             const areaFraction = blockArea / pageArea;
 
             let kind = 'mixed';
-            const isLineOrCrease = (aspectRatio < 0.38 && textCoverage < 0.12 && textItemCount < 8) || 
-                                   (aspectRatio > 5.5 && textCoverage < 0.12 && textItemCount < 8);
+            const isLineOrCrease = (aspectRatio < 0.22 && textCoverage < 0.08 && textItemCount < 4) || 
+                                   (aspectRatio > 7.5 && textCoverage < 0.08 && textItemCount < 4);
 
             if (isLineOrCrease) {
                 kind = 'noise';
-            } else if (textCoverage >= 0.16 || (textItemCount >= 9 && textCoverage >= 0.12)) {
+            } else if (textCoverage >= 0.28 || (textItemCount >= 18 && textCoverage >= 0.20)) {
                 kind = 'text';
-            } else if (textItemCount >= 9 && textCoverage < 0.12) {
-                kind = 'mixed';
-            } else if (textItemCount >= 2 && block.h <= 120 && textCoverage >= 0.05) {
+            } else if (textItemCount >= 2 && block.h <= 75 && textCoverage >= 0.12 && aspectRatio > 2.0) {
                 kind = 'caption';
-            } else if (textCoverage <= 0.035 && textItemCount <= 2 && blockArea >= Math.max(7000, pageArea * 0.008) && aspectRatio >= 0.18 && aspectRatio <= 5.5) {
-                // Ignore decorative header/footer banners (at top 15% or bottom 12% margins)
-                const isHeaderFooter = (block.y < h * 0.15) || (block.y + block.h > h * 0.88);
-                if (isHeaderFooter && block.w > w * 0.5) {
+            } else if (textCoverage <= 0.25 && blockArea >= Math.max(3000, pageArea * 0.005) && aspectRatio >= 0.15 && aspectRatio <= 6.5) {
+                // Ignore decorative header/footer banners
+                const isHeaderFooter = (block.y < h * 0.08) || (block.y + block.h > h * 0.94);
+                if (isHeaderFooter && block.w > w * 0.6) {
                     kind = 'noise';
                 } else {
                     kind = 'image';
                 }
             } else if (textItemCount === 0) {
-                if (blockArea >= 2500 && aspectRatio >= 0.18 && aspectRatio <= 5.5) {
+                if (blockArea >= 1500 && aspectRatio >= 0.15 && aspectRatio <= 6.5) {
                     kind = 'image';
                 } else {
                     kind = 'noise';
                 }
-            } else if (areaFraction < 0.004 && textItemCount <= 1) {
+            } else if (textCoverage < 0.40 && blockArea >= 4000) {
+                kind = 'mixed';
+            } else if (areaFraction < 0.002 && textItemCount <= 1) {
                 kind = 'noise';
-            } else if (block.w < 35 || block.h < 35) {
+            } else if (block.w < 25 || block.h < 25) {
                 kind = 'noise';
             }
 
@@ -3561,6 +4122,35 @@ async function analyzePageLayout(canvas, page, pageNum) {
             w: b.w / canvasScale,
             h: b.h / canvasScale
         }));
+    }
+
+    // ผสานรูปภาพจริงที่สกัดได้จาก PDF Object เข้ากับ layout blocks
+    try {
+        const viewportAtScale1 = page.getViewport({ scale: 1 });
+        const pdfImageObjects = await extractPdfImageObjects(page, viewportAtScale1);
+        if (pdfImageObjects && pdfImageObjects.length > 0) {
+            const currentBlocks = pageLayoutBlocks[pageNum] || [];
+            for (const pImg of pdfImageObjects) {
+                let matchedCanvasBlock = null;
+                for (const b of currentBlocks) {
+                    const overlap = getOverlapArea(b, pImg);
+                    if (overlap > Math.min(b.w * b.h, pImg.w * pImg.h) * 0.35) {
+                        matchedCanvasBlock = b;
+                        break;
+                    }
+                }
+                if (matchedCanvasBlock) {
+                    matchedCanvasBlock.kind = 'image';
+                    matchedCanvasBlock.source = 'pdf-object';
+                    matchedCanvasBlock.isExactImage = true;
+                } else {
+                    currentBlocks.push(pImg);
+                }
+            }
+            pageLayoutBlocks[pageNum] = currentBlocks;
+        }
+    } catch (pdfObjErr) {
+        console.warn('[analyzePageLayout] PDF image object extraction failed:', pdfObjErr);
     }
 }
 
@@ -3601,13 +4191,19 @@ function getRefinedLayoutRegion(pageNum, region) {
  */
 function findEnglishAnchor(text) {
     if (!text) return null;
-    // Match **...** (**English**, ...)
+    // 1. Match "(EnglishAnchor, ...)" inside parens (handles both plain text and markdown)
+    const parenMatch = text.match(/\(\s*\(?\s*\*?\*?([A-Za-z][A-Za-z0-9\s/-]*?)\*?\*?(?:,|\))/);
+    if (parenMatch && parenMatch[1]) {
+        const a = parenMatch[1].trim().replace(/[*_]/g, '');
+        if (a.length >= 2) return a;
+    }
+    // 2. Match **...** (**English**, ...)
     const m = text.match(/\*\*([^*]+)\*\*\s*\(\(?([A-Za-z][^)]+)\)/);
     if (m && m[2]) {
-        const anchor = m[2].split(',')[0].trim();
+        const anchor = m[2].split(',')[0].trim().replace(/[*_]/g, '');
         if (anchor.length >= 2) return anchor;
     }
-    // Fallback: any English word >= 4 chars
+    // 3. Fallback: any English word >= 4 chars
     const engWords = text.match(/\b[A-Za-z]{4,}\b/g);
     return engWords ? engWords[0] : null;
 }
@@ -4051,6 +4647,7 @@ async function goToPage(pageNum) {
         // The Gemini response is in a separate webview.  Explicitly stop it before
         // changing batches so a delayed TTS response from the old page cannot play.
         stopActiveTts();
+        if (geminiWebview) geminiWebview.executeJavaScript('window.resetAutoReadState && window.resetAutoReadState()').catch(() => {});
         currentPage = pageNum;
         isGeminiResponding = false;
         isProcessingPage = false;
@@ -4070,6 +4667,9 @@ async function goToPage(pageNum) {
             geminiWebview.classList.remove('prefetch-hidden');
             prefetchWebview.classList.add('prefetch-hidden');
 
+            geminiWebview.executeJavaScript('window.__isPrefetchWebview = false;').catch(() => {});
+            prefetchWebview.executeJavaScript('window.__isPrefetchWebview = true;').catch(() => {});
+
             // Update current account index
             currentAccountIndex = pendingNextAccountIndex;
             if (accountSelect) {
@@ -4087,6 +4687,32 @@ async function goToPage(pageNum) {
             showToast(`หน้าเปลี่ยน (แสดงข้อมูลที่สรุปไว้ล่วงหน้า)`, 'success');
 
             await fitToPage();
+
+            // Actively trigger first li read and smart highlight on the newly active page!
+            setTimeout(() => {
+                if (geminiWebview) {
+                    geminiWebview.executeJavaScript(`
+                        try {
+                            window.__isPrefetchWebview = false;
+                            if (window.resetAutoReadState) window.resetAutoReadState();
+                            var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
+                            if (resp.length > 0) {
+                                var c = resp[resp.length - 1];
+                                c.classList.add('focus-response-container');
+                                var items = Array.from(c.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5 && l.style.display !== 'none'; });
+                                if (items.length > 0) {
+                                    items.forEach(function(l) { l.classList.remove('active-focus'); });
+                                    items[0].classList.add('active-focus');
+                                    c.dataset.focusIndex = '0';
+                                    if (typeof triggerHighlight === 'function') triggerHighlight(items[0]);
+                                    if (typeof speakLi === 'function') speakLi(items[0]);
+                                }
+                            }
+                            if (typeof requestLiImageCheck === 'function') requestLiImageCheck();
+                        } catch(e) { console.error('Prefetch activation error:', e); }
+                    `).catch(() => {});
+                }
+            }, 300);
         } else {
             // Clear prefetch if it was a manual mismatch jump
             pendingNextBatchText = '';
@@ -4815,9 +5441,15 @@ async function preSummarizeNextBatch(textToSummarize, startPage, endPage, illust
         const prompt = `สรุปเนื้อหาจาก PDF จำนวน ${batchSize} หน้า (หน้าที่ ${startPage} ถึง ${endPage}) เป็นภาษาไทย:
 - สรุปแบ่งเป็นประเด็นสำคัญๆ ให้ครอบคลุมเนื้อหาทั้งหมด
 - ใช้รายการหัวข้อย่อย (Bullet points) ที่กระชับและเข้าใจง่าย ให้เป็น <li> เดียว อย่าซ้อน
-- **รูปแบบบังคับ:** ทุกหัวข้อต้องใช้รูปแบบ: **คำภาษาไทย** (**EnglishAnchor**, Alias1, Alias2): คำอธิบาย...
-- **สำคัญมาก:** ต้องมีคำภาษาอังกฤษตัวหนาในวงเล็บหลังคำภาษาไทยเสมอ (EnglishAnchor) เช่น **ข้าวโพด** (**Corn**, Maize): ...
-- ถ้ามีชื่อวิทยาศาสตร์ ให้ใส่ต่อท้าย EnglishAnchor คั่นด้วย comma เช่น (**Zea mays**, Corn, Maize)
+- **รูปแบบบังคับ:** ทุกหัวข้อต้องใช้รูปแบบ: **คำภาษาไทย (EnglishAnchor, Alias1)**: คำอธิบาย...
+- **กฎสำคัญมากเรื่องวงเล็บ:**
+  * ใช้วงเล็บชั้นเดียวเท่านั้น **ห้ามใส่วงเล็บซ้อนกันเด็ดขาด** (ห้ามมี (( หรือ ( ( หรือ )) )
+  * วงเล็บภาษาอังกฤษให้ใส่เฉพาะหลังหัวข้อภาษาไทยเท่านั้น
+  * **ห้ามใส่วงเล็บครอบข้อความคำอธิบาย** ให้เขียนคำอธิบายเนื้อหาเป็นประโยคข้อความภาษาไทยธรรมดา
+- **ตัวอย่างที่ถูกต้อง:**
+  * **อุปกรณ์ช่วยตัดจันทัน (Rafter Jig, Pitch Jig)**: เครื่องมือหรือแม่แบบที่สร้างขึ้นเองได้ง่ายภายใน 5 ถึง 10 นาที โดยใช้เศษไม้อัด...
+  * **ความลาดเอียงหลังคา (Roof Pitch, Slope)**: อัตราส่วนความสูงต่อความยาวในแนวนอนเพื่อสร้างรูปสามเหลี่ยม...
+- ถ้ามีชื่อวิทยาศาสตร์ ให้ใส่ต่อท้าย EnglishAnchor คั่นด้วย comma เช่น **ข้าวโพด (Corn, Zea mays)**: ...
 - หากมีภาพประกอบที่เกี่ยวข้อง ให้ตั้ง EnglishAnchor ให้ตรงกับชื่อวัตถุ/กระบวนการในภาพและข้อความกำกับภาพ เพื่อให้ระบบจับคู่ภาพได้แม่นยำ
 - ห้ามใช้ Tag HTML ทุกชนิด ให้ใช้รูปแบบ Markdown ปกติเท่านั้น
 - ไม่ต้องเกริ่นนำหรือลงท้าย เอาเฉพาะเนื้อสรุป
@@ -4869,6 +5501,7 @@ ${textToSummarize}`;
             }
             // Inject script to prefetchWebview if not ready
             await injectGeminiScript(prefetchWebview);
+            await prefetchWebview.executeJavaScript('window.__isPrefetchWebview = true;').catch(() => {});
             await new Promise(r => setTimeout(r, 2000));
         }
 
@@ -5022,9 +5655,15 @@ async function sendToGemini(textToSummarize, startPage, endPage, illustrationIma
         const prompt = `สรุปเนื้อหาจาก PDF จำนวน ${batchSize} หน้า (หน้าที่ ${startPage} ถึง ${endPage}) เป็นภาษาไทย:
 - สรุปแบ่งเป็นประเด็นสำคัญๆ ให้ครอบคลุมเนื้อหาทั้งหมด
 - ใช้รายการหัวข้อย่อย (Bullet points) ที่กระชับและเข้าใจง่าย ให้เป็น <li> เดียว อย่าซ้อน
-- **รูปแบบบังคับ:** ทุกหัวข้อต้องใช้รูปแบบ: **คำภาษาไทย** (**EnglishAnchor**, Alias1, Alias2): คำอธิบาย...
-- **สำคัญมาก:** ต้องมีคำภาษาอังกฤษตัวหนาในวงเล็บหลังคำภาษาไทยเสมอ (EnglishAnchor) เช่น **ข้าวโพด** (**Corn**, Maize): ...
-- ถ้ามีชื่อวิทยาศาสตร์ ให้ใส่ต่อท้าย EnglishAnchor คั่นด้วย comma เช่น (**Zea mays**, Corn, Maize)
+- **รูปแบบบังคับ:** ทุกหัวข้อต้องใช้รูปแบบ: **คำภาษาไทย (EnglishAnchor, Alias1)**: คำอธิบาย...
+- **กฎสำคัญมากเรื่องวงเล็บ:**
+  * ใช้วงเล็บชั้นเดียวเท่านั้น **ห้ามใส่วงเล็บซ้อนกันเด็ดขาด** (ห้ามมี (( หรือ ( ( หรือ )) )
+  * วงเล็บภาษาอังกฤษให้ใส่เฉพาะหลังหัวข้อภาษาไทยเท่านั้น
+  * **ห้ามใส่วงเล็บครอบข้อความคำอธิบาย** ให้เขียนคำอธิบายเนื้อหาเป็นประโยคข้อความภาษาไทยธรรมดา
+- **ตัวอย่างที่ถูกต้อง:**
+  * **อุปกรณ์ช่วยตัดจันทัน (Rafter Jig, Pitch Jig)**: เครื่องมือหรือแม่แบบที่สร้างขึ้นเองได้ง่ายภายใน 5 ถึง 10 นาที โดยใช้เศษไม้อัด...
+  * **ความลาดเอียงหลังคา (Roof Pitch, Slope)**: อัตราส่วนความสูงต่อความยาวในแนวนอนเพื่อสร้างรูปสามเหลี่ยม...
+- ถ้ามีชื่อวิทยาศาสตร์ ให้ใส่ต่อท้าย EnglishAnchor คั่นด้วย comma เช่น **ข้าวโพด (Corn, Zea mays)**: ...
 - หากมีภาพประกอบที่เกี่ยวข้อง ให้ตั้ง EnglishAnchor ให้ตรงกับชื่อวัตถุ/กระบวนการในภาพและข้อความกำกับภาพ เพื่อให้ระบบจับคู่ภาพได้แม่นยำ
 - ห้ามใช้ Tag HTML ทุกชนิด ให้ใช้รูปแบบ Markdown ปกติเท่านั้น
 - ไม่ต้องเกริ่นนำหรือลงท้าย เอาเฉพาะเนื้อสรุป
@@ -5150,7 +5789,7 @@ ${textToSummarize}`;
                     window.geminiRequestSent = true;
                     // Force the injected status watcher to wait for the response that
                     // follows this send, instead of reusing the old idle DONE state.
-                    geminiWebview.executeJavaScript('window.lastStatus = "WAITING"').catch(() => {});
+                    geminiWebview.executeJavaScript('window.lastStatus = "WAITING"; if (window.resetAutoReadState) window.resetAutoReadState();').catch(() => {});
                 } else if (result !== "CLICKED") {
                     console.log("sendToGemini: send failed after retries:", result);
                     window.geminiRequestSent = false;
