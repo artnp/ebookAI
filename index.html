@@ -46,11 +46,6 @@
       </div>
 
       <div class="header-right">
-        <label class="offline-mode-control" title="Offline: บันทึกสรุปเป็น PDF ที่ Desktop โดยไม่ส่ง GitHub">
-          <input id="offlineModeToggle" type="checkbox">
-          <span class="offline-mode-slider"></span>
-          <span id="offlineModeLabel">Online</span>
-        </label>
         <div class="batch-size-control"
           style="display: flex; align-items: center; gap: 6px; margin-right: 12px; border-right: 1px solid var(--border-color); padding-right: 12px;">
           <label for="batchSizeInput"
@@ -165,10 +160,16 @@
             allowpopups></webview>
         </div>
         <div class="gemini-footer">
+          <div id="latestBigdataContainer" class="latest-bigdata-container" title="คลิกเพื่อเปิดดูไฟล์ล่าสุดบน GitHub">
+            <span id="latestBigdataInfo" class="latest-bigdata-info">
+              <span class="bigdata-badge">💾</span>
+              <span class="bigdata-file">bigdata1.json</span>
+              <span class="bigdata-line">บรรทัด 1</span>
+            </span>
+          </div>
           <button id="bottomNextPageBtn" class="btn btn-primary next-page-bottom-btn" title="หน้าถัดไป">
             หน้าถัดไป ❯
           </button>
-          <span id="latestBigdataInfo" class="latest-bigdata-info"><span class="bigdata-file">💾 bigdata1.json</span> <span class="bigdata-line">(บรรทัด 1)</span></span>
         </div>
 
         <!-- Hidden Data for Reference -->
