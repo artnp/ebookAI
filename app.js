@@ -15,8 +15,8 @@ let lastPromptIllustrationImages = [];
 let debounceTimer = null;
 let isProcessingPage = false;
 let isGeminiResponding = false;
-let batchSize = 1; // Offline mode and new documents summarize one page at a time by default
-let isOfflineMode = false;
+let batchSize = 1;
+const isOfflineMode = false;
 
 function getOnlineBatchSize(pages) {
     if (!pages || pages <= 0) return 10;
@@ -24,7 +24,6 @@ function getOnlineBatchSize(pages) {
     if (pages >= 200) return 20;
     return 10;
 }
-let offlineDocuments = {}; // Documents explicitly chosen for Offline mode
 let pageTextMap = {}; // Map to store text content of each page for searching
 // pageLayoutBlocks declared below with analyzePageLayout
 let highlightContextRecursion = 0;
@@ -265,54 +264,20 @@ async function init() {
 
 // Event Listeners
 function setupEventListeners() {
-    const offlineModeToggle = document.getElementById('offlineModeToggle');
-    const offlineModeLabel = document.getElementById('offlineModeLabel');
-    if (offlineModeToggle) {
-        offlineModeToggle.addEventListener('change', () => {
-            isOfflineMode = offlineModeToggle.checked;
-            if (currentFileName) {
-                const key = `document:${currentFileName.toLowerCase()}`;
-                if (isOfflineMode) offlineDocuments[key] = true;
-                else delete offlineDocuments[key];
-            }
-            if (offlineModeLabel) offlineModeLabel.textContent = isOfflineMode ? 'Offline' : 'Online';
-            if (isOfflineMode && batchSizeInput) {
-                batchSize = 1;
-                batchSizeInput.value = 1;
-                if (pdfDoc) updateNavigation();
-            } else if (!isOfflineMode && batchSizeInput) {
-                if (pdfDoc) {
-                    window.electronAPI.loadProgress(currentFilePath).then((sp) => {
-                        if (sp && sp.batchSize) {
-                            batchSize = sp.batchSize;
-                        } else {
-                            batchSize = getOnlineBatchSize(totalPages);
-                        }
-                        if (batchSizeInput) batchSizeInput.value = batchSize;
-                        updateNavigation();
-                        renderKeysPages();
-                        extractTextBatch(currentPage, Math.min(currentPage + batchSize - 1, totalPages));
-                        saveProgress();
-                    });
-                }
-            }
-            saveAppSettings();
-            setOfflineModeForWebviews();
-            showToast(isOfflineMode ? 'Offline: จะบันทึก PDF ที่ Desktop' : 'Online: จะบันทึกลง GitHub', 'info');
-            if (isOfflineMode && pdfDoc) {
-                // Start the current page immediately; subsequent pages are triggered after each PDF save.
-                window.offlineAutoSaveTriggered = false;
-                lastPromptedText = '';
-                isProcessingPage = false;
-                isGeminiResponding = false;
-                extractTextBatch(currentPage, currentPage);
-            }
-        });
-    }
     if (libraryBtn) libraryBtn.addEventListener('click', toggleLibrary);
     if (closeLibraryBtn) closeLibraryBtn.addEventListener('click', hideLibrary);
     if (addBookBtn) addBookBtn.addEventListener('click', () => { hideLibrary(); openFile(); });
     if (openFileBtn2) openFileBtn2.addEventListener('click', openFile);
+
+    // Track user interactions to support hands-free reading detection
+    ['mousemove', 'wheel', 'keydown', 'mousedown'].forEach(evt => {
+        document.addEventListener(evt, () => {
+            window.lastAppMouseMoveTime = Date.now();
+            if (geminiWebview) {
+                geminiWebview.executeJavaScript('window.__onExternalMouseMove && window.__onExternalMouseMove();').catch(() => {});
+            }
+        }, { passive: true });
+    });
 
     prevPageBtn.addEventListener('click', () => {
         if (window.isSwitchingPage) return;
@@ -504,6 +469,35 @@ function setupEventListeners() {
     setupPanelResizer();
     window.addEventListener('resize', () => { if (pdfDoc) fitToPage(); });
 
+    // Minimize & Visibility: Stop reading and TTS audio when app is minimized or hidden
+    if (window.electronAPI && window.electronAPI.onAppMinimized) {
+        window.electronAPI.onAppMinimized(() => {
+            console.log('[App] Window minimized -> stopping active TTS & auto-reading');
+            stopActiveTts();
+        });
+    }
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            console.log('[App] Visibility hidden -> stopping active TTS & auto-reading');
+            stopActiveTts();
+        }
+    });
+
+    const latestBigdataContainer = document.getElementById('latestBigdataContainer');
+    if (latestBigdataContainer) {
+        latestBigdataContainer.addEventListener('click', () => {
+            const file = localStorage.getItem('latestBigdataFile') || 'bigdata1.json';
+            if (GITHUB_USER && GITHUB_REPO) {
+                const url = `https://github.com/${GITHUB_USER}/${GITHUB_REPO}/blob/${GITHUB_BRANCH || 'main'}/${file}`;
+                if (window.electronAPI && window.electronAPI.openExternal) {
+                    window.electronAPI.openExternal(url);
+                } else {
+                    window.open(url, '_blank');
+                }
+            }
+        });
+    }
+
     // Share Modal Events
     const shareModal = document.getElementById('shareModal');
     const cancelShareBtn = document.getElementById('cancelShareBtn');
@@ -519,18 +513,115 @@ function setupEventListeners() {
     if (confirmShareBtn) {
         confirmShareBtn.addEventListener('click', () => {
             const text = document.getElementById('shareText').value;
-            if (isOfflineMode) enqueueSaveTask(() => saveOfflineSummary(text));
-            else uploadScreenshotAndSave(text);
+            uploadScreenshotAndSave(text);
             shareModal.classList.remove('show');
             setTimeout(() => shareModal.style.visibility = 'hidden', 200);
         });
+    }
+
+    // Unified TTS Audio Cache & Concurrency-Controlled Prefetch Manager
+    window.__ttsCache = window.__ttsCache || {};
+    window.__ttsInFlight = window.__ttsInFlight || new Map();
+    window.__ttsPrefetchQueue = window.__ttsPrefetchQueue || [];
+    let activePrefetchWorkers = 0;
+    const MAX_PREFETCH_CONCURRENCY = 2;
+    const MAX_CACHE_ENTRIES = 300;
+
+    function trimTtsCache() {
+        const keys = Object.keys(window.__ttsCache);
+        if (keys.length > MAX_CACHE_ENTRIES) {
+            for (let i = 0; i < 50; i++) {
+                delete window.__ttsCache[keys[i]];
+            }
+        }
+    }
+
+    function processTtsPrefetchQueue() {
+        while (activePrefetchWorkers < MAX_PREFETCH_CONCURRENCY && window.__ttsPrefetchQueue.length > 0) {
+            const text = window.__ttsPrefetchQueue.shift();
+            if (!text || window.__ttsCache[text] || window.__ttsInFlight.has(text)) {
+                continue;
+            }
+            activePrefetchWorkers++;
+            const promise = window.electronAPI.edgeSpeak(text)
+                .then((res) => {
+                    if (res && res.audio) {
+                        window.__ttsCache[text] = { audio: res.audio, duration: res.duration };
+                        trimTtsCache();
+                    }
+                    return res;
+                })
+                .catch((err) => {
+                    console.error('[TTS Prefetch Error]', err);
+                    return { error: err.message };
+                })
+                .finally(() => {
+                    window.__ttsInFlight.delete(text);
+                    activePrefetchWorkers--;
+                    processTtsPrefetchQueue();
+                });
+            window.__ttsInFlight.set(text, promise);
+        }
+    }
+
+    function requestTtsPrefetch(text) {
+        if (!text || text.length < 2) return;
+        if (window.__ttsCache[text]) return;
+        if (window.__ttsInFlight.has(text)) return;
+        if (window.__ttsPrefetchQueue.includes(text)) return;
+        window.__ttsPrefetchQueue.push(text);
+        processTtsPrefetchQueue();
+    }
+
+    function getOrFetchTts(text) {
+        if (window.__ttsCache[text]) {
+            return Promise.resolve(window.__ttsCache[text]);
+        }
+        if (window.__ttsInFlight.has(text)) {
+            return window.__ttsInFlight.get(text);
+        }
+        const qIdx = window.__ttsPrefetchQueue.indexOf(text);
+        if (qIdx !== -1) window.__ttsPrefetchQueue.splice(qIdx, 1);
+
+        const promise = window.electronAPI.edgeSpeak(text)
+            .then((res) => {
+                if (res && res.audio) {
+                    window.__ttsCache[text] = { audio: res.audio, duration: res.duration };
+                    trimTtsCache();
+                }
+                return res;
+            })
+            .finally(() => {
+                window.__ttsInFlight.delete(text);
+                processTtsPrefetchQueue();
+            });
+        window.__ttsInFlight.set(text, promise);
+        return promise;
     }
 
     function setupWebviewListeners(webview, isPrefetchGetter) {
         let injectTimer = null;
         webview.addEventListener('dom-ready', () => {
             const isPrefetch = isPrefetchGetter();
-            webview.executeJavaScript(`window.__ebookOfflineMode = ${isOfflineMode ? 'true' : 'false'};`).catch(() => {});
+            webview.executeJavaScript(`
+                try {
+                    window.__ebookOfflineMode = false;
+                    if (window.Notification) {
+                        window.Notification = function() {
+                            return {
+                                close: function() {},
+                                addEventListener: function() {},
+                                removeEventListener: function() {},
+                                dispatchEvent: function() { return false; }
+                            };
+                        };
+                        window.Notification.permission = 'denied';
+                        window.Notification.requestPermission = function() {
+                            return Promise.resolve('denied');
+                        };
+                    }
+                } catch(e) {}
+            `).catch(() => {});
             console.log(`Gemini webview dom-ready (isPrefetch: ${isPrefetch})`);
             if (!isPrefetch) {
                 if (!window.lastPromptId) {
@@ -562,18 +653,9 @@ function setupEventListeners() {
             const msg = e.message;
             const isPrefetch = isPrefetchGetter();
 
-            if (msg === '__OFFLINE_LAST_LI_WHEEL__') {
-                if (isOfflineMode && pdfDoc && currentPage + batchSize <= totalPages) {
-                    goToPage(currentPage + batchSize);
-                    showToast('เปลี่ยนหน้าถัดไป', 'info');
-                }
-            } else if (msg === '__OFFLINE_SEQUENCE_END__') {
-                window.offlineSequenceEnded = true;
-            } else if (msg.startsWith('__NEXT_PAGE__')) {
+            if (msg.startsWith('__NEXT_PAGE__')) {
                 if (isPrefetch) return;
                 if (isAutoPageAdvancePaused) return;
-                // Offline reading stays on the current page until the user changes it.
-                if (isOfflineMode) return;
                 const parts = msg.split(':');
                 if (parts.length > 1) {
                     const range = parts[1].split('-');
@@ -591,6 +673,8 @@ function setupEventListeners() {
                 }
             } else if (msg === '__GEMINI_DONE__') {
                 console.log(`Gemini finished generating summary (isPrefetch: ${isPrefetch}).`);
+                window.activeGeminiRequestId = null;
+                webview.executeJavaScript('window.ttsPrefetchAllPrompts && window.ttsPrefetchAllPrompts()').catch(() => {});
                 if (isPrefetch) {
                     isPrefetchResponding = false;
                     isPrefetchReady = true;
@@ -621,18 +705,11 @@ function setupEventListeners() {
                     }
                     isGeminiResponding = false;
                     isProcessingPage = false;
-                    if (!isOfflineMode) window.scheduleAutoNextPageBatch();
-                    // In Offline mode save the focused first summary automatically. The save
-                    // completion handler advances the document only after the PDF is written.
-                    if (isOfflineMode && pdfDoc && !window.offlineAutoSaveTriggered) {
-                        window.offlineAutoSaveTriggered = true;
-                        window.offlineSequenceActive = true;
-                        window.offlineSequenceEnded = false;
-                        setTimeout(() => autoSaveOfflineCurrentResponse(), 1800);
-                    }
+                    window.scheduleAutoNextPageBatch();
                     })();
                 }
             } else if (msg === '__GEMINI_VALID_LI__') {
+                window.activeGeminiRequestId = null;
                 if (isPrefetch || !isAutoPageAdvancePaused) return;
                 // The user repaired/regenerated the response. Resume only after the
                 // same structural validation succeeds; authentication pages never pass.
@@ -642,10 +719,6 @@ function setupEventListeners() {
                 const text = msg.substring('__GITHUB_SAVE__:'.length);
                 const cleanText = text.replace(/[*_]/g, '').trim();
                 enqueueSaveTask(async () => {
-                    if (isOfflineMode) {
-                        await saveOfflineSummary(text);
-                        return;
-                    }
                     const saved = await uploadTextAndImageWithBlock(cleanText);
                     if (!saved) {
                         await saveTextToGitHubWithProgress(cleanText);
@@ -664,8 +737,7 @@ function setupEventListeners() {
                     } catch (e) {
                         console.error('Highlight error before capture:', e);
                     }
-                    if (isOfflineMode) await saveOfflineSummary(shareText);
-                    else await uploadScreenshotAndSave(shareText);
+                    await uploadScreenshotAndSave(shareText);
                 });
             } else if (msg.startsWith('__OPEN_URL__:')) {
                 window.electronAPI.openExternal(msg.substring('__OPEN_URL__:'.length));
@@ -679,33 +751,32 @@ function setupEventListeners() {
                     window.highlightDebounce = setTimeout(() => highlightContextInPDF(terms), 200);
                 }
             } else if (msg === '__TTS_STOP_EDGE__') {
-                window.edgeTtsGeneration = (window.edgeTtsGeneration || 0) + 1;
                 if (window.__edgeAudio) {
                     window.__edgeAudio.pause();
                     if (window.__edgeAudio._ebookUrl) URL.revokeObjectURL(window.__edgeAudio._ebookUrl);
                     window.__edgeAudio.remove();
                     window.__edgeAudio = null;
                 }
+                if (!window.__ttsLoadingAudio) {
+                    window.edgeTtsGeneration = (window.edgeTtsGeneration || 0) + 1;
+                }
                 webview.executeJavaScript('window.__ttsStop && window.__ttsStop()');
             } else if (msg.startsWith('__TTS_CACHE__:')) {
                 var cacheText = msg.substring('__TTS_CACHE__:'.length);
-                if (!window.__ttsCache) window.__ttsCache = {};
-                if (window.__ttsCache[cacheText]) return;
-                window.electronAPI.edgeSpeak(cacheText).then(function(res) {
-                    if (res && res.audio) {
-                        window.__ttsCache[cacheText] = { audio: res.audio, duration: res.duration };
-                    }
-                }).catch(function() {});
+                requestTtsPrefetch(cacheText);
             } else if (msg.startsWith('__TTS_EDGE__:')) {
                 if (isPrefetch) return;
                 var edgeText = msg.substring('__TTS_EDGE__:'.length);
                 var ttsGeneration = (window.edgeTtsGeneration || 0) + 1;
                 window.edgeTtsGeneration = ttsGeneration;
                 window.__ttsLoadingAudio = true; // Mark audio is currently loading
-                if (!window.__ttsCache) window.__ttsCache = {};
+                console.log('[TTS_EDGE] Starting synthesis gen ' + ttsGeneration + ' for: ' + edgeText.slice(0, 45));
                 function playTTS(audioData, dur) {
                     // Ignore a response that arrived after the reader moved to another item/page.
-                    if (ttsGeneration !== window.edgeTtsGeneration) return;
+                    if (ttsGeneration !== window.edgeTtsGeneration) {
+                        console.warn('[TTS_EDGE] Dropped audio for gen ' + ttsGeneration + ' (active is ' + window.edgeTtsGeneration + ')');
+                        return;
+                    }
                     window.__ttsLoadingAudio = false; // Audio is ready!
                     if (window.__edgeAudio) {
                         window.__edgeAudio.pause();
@@ -719,6 +790,7 @@ function setupEventListeners() {
                         window.__edgeAudio._ebookUrl = audioUrl;
                         window.__edgeAudio.volume = 1;
                         window.__edgeAudio.play().catch(function(e) { console.error('EdgeTTS play error:', e); });
+                        console.log('[TTS_EDGE] Playing audio for gen ' + ttsGeneration + ', dur: ' + dur);
                         webview.executeJavaScript('window.__ttsStart && window.__ttsStart(' + dur + ')');
                         
                         // Execute the deferred PDF scroll now that audio is playing!
@@ -730,7 +802,7 @@ function setupEventListeners() {
                         window.__edgeAudio.onended = function() {
                             URL.revokeObjectURL(audioUrl);
                             if (ttsGeneration !== window.edgeTtsGeneration) return;
-                            webview.executeJavaScript('window.__ttsStop && window.__ttsStop()');
+                            webview.executeJavaScript('window.__ttsStop && window.__ttsStop(); window.__ttsOnAudioEnded && window.__ttsOnAudioEnded();');
                         };
                     } catch(e) {
                         console.error('EdgeTTS audio error:', e);
@@ -739,11 +811,10 @@ function setupEventListeners() {
                             window.executeDeferredPdfScroll();
                             window.executeDeferredPdfScroll = null;
                         }
+                        webview.executeJavaScript('window.__ttsStop && window.__ttsStop(); window.__ttsOnAudioEnded && window.__ttsOnAudioEnded();').catch(() => {});
                     }
                 }
-                var cached = window.__ttsCache[edgeText];
-                if (cached) { playTTS(cached.audio, cached.duration); return; }
-                window.electronAPI.edgeSpeak(edgeText).then(function(res) {
+                getOrFetchTts(edgeText).then(function(res) {
                     if (ttsGeneration !== window.edgeTtsGeneration) return;
                     if (res && res.error) {
                         window.__ttsLoadingAudio = false;
@@ -753,9 +824,9 @@ function setupEventListeners() {
                         }
                         console.error('EdgeTTS error:', res.error);
                         showToast('TTS ล้มเหลว ลองอีกครั้ง', 'error');
+                        webview.executeJavaScript('window.__ttsStop && window.__ttsStop(); window.__ttsOnAudioEnded && window.__ttsOnAudioEnded();').catch(() => {});
                         return;
                     }
-                    window.__ttsCache[edgeText] = { audio: res.audio, duration: res.duration };
                     playTTS(res.audio, res.duration);
                 }).catch(function(e) {
                     window.__ttsLoadingAudio = false;
@@ -763,6 +834,7 @@ function setupEventListeners() {
                         window.executeDeferredPdfScroll();
                         window.executeDeferredPdfScroll = null;
                     }
+                    webview.executeJavaScript('window.__ttsStop && window.__ttsStop(); window.__ttsOnAudioEnded && window.__ttsOnAudioEnded();').catch(() => {});
                 });
             } else if (msg.startsWith('__CHECK_LI_IMAGES__:')) {
                 if (isPrefetch) return;
@@ -799,9 +871,12 @@ function setupEventListeners() {
                     } catch (e) {
                         console.error('Highlight error before capture:', e);
                     }
-                    if (isOfflineMode) await saveOfflineSummary(shareText);
-                    else await uploadScreenshotAndSave(shareText);
+                    await uploadScreenshotAndSave(shareText);
                 });
+            } else if (msg.startsWith('__TTS_DEBUG__:')) {
+                console.log('[WebviewTTS]', msg.substring('__TTS_DEBUG__:'.length), '| isPrefetch:', isPrefetch);
+            } else if (e.level === 3 || msg.includes('Error') || msg.includes('TypeError') || msg.includes('ReferenceError')) {
+                console.warn('[WebviewError]', msg);
             }
         });
     }
@@ -1091,7 +1166,7 @@ async function ensurePageLayoutBlocks(pageNum) {
             const offscreenCanvas = document.createElement('canvas');
             offscreenCanvas.width = viewport.width;
             offscreenCanvas.height = viewport.height;
-            const ctx = offscreenCanvas.getContext('2d');
+            const ctx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
             await page.render({ canvasContext: ctx, viewport: viewport }).promise;
             await analyzePageLayout(offscreenCanvas, page, pageNum);
         } catch (e) {
@@ -1102,8 +1177,8 @@ async function ensurePageLayoutBlocks(pageNum) {
 }
 
 // เลือกภาพประกอบแบบ retry: เริ่มจากภาพที่อยู่ติด anchor มากที่สุด แล้วค่อยผ่อนระยะค้นหา
-// พัฒนาใหม่: รองรับไดอะแกรมขนาดใหญ่, ภาพแปลน, ภาพประกอบลายเส้น และมี Page-level Fallback
-async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, canvasH) {
+// พัฒนาใหม่: รองรับไดอะแกรมขนาดใหญ่, ภาพแปลน, และป้องกันการดึงภาพอื่นในหน้ามาทับเนื้อหาข้อความ
+async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, canvasH, textMentionsVisual = false) {
     let blocks = getPageLayoutBlocksAtScale(pageNum, scale);
     if (!blocks || blocks.length === 0) {
         await ensurePageLayoutBlocks(pageNum);
@@ -1118,8 +1193,9 @@ async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, can
     // ปรับเพิ่มให้รองรับภาพผัง ไดอะแกรมขนาดใหญ่ถึง 88% ของหน้ากระดาษ (ตัดเฉพาะกระดาษเปล่าทั้งหน้า > 94%)
     const MAX_ILLUSTRATION_FRACTION = 0.88;
 
-    // ขยาย 3 ระยะ: ติดชิดย่อหน้า (35%), ในระยะสายตา (60%), ทั่วทั้งหน้า (90%)
-    const passes = [0.35, 0.60, 0.90];
+    // ขยายระยะค้นหา: ถ้าข้อความไม่ได้เจาะจงภาพ ค้นหาเฉพาะในระยะชิดย่อหน้า (pass 1 และ 2)
+    // เพื่อไม่ให้ดึงภาพอื่นในหน้ามาทับเนื้อหาข้อความสรุป
+    const passes = textMentionsVisual ? [0.35, 0.60, 0.90] : [0.35, 0.55];
     for (let pass = 0; pass < passes.length; pass++) {
         const maxDistance = canvasH * passes[pass];
         const candidates = blocks
@@ -1171,7 +1247,7 @@ async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, can
 
         if (candidates.length) {
             const best = candidates[0];
-            console.log(`[Smart Crop] illustration retry ${pass + 1}/3 accepted`, {
+            console.log(`[Smart Crop] illustration retry ${pass + 1}/${passes.length} accepted`, {
                 size: `${Math.round(best.block.w)}x${Math.round(best.block.h)}`,
                 ink: best.evidence.inkRatio.toFixed(3), distance: Math.round(best.distance),
                 source: best.block.source || 'layout'
@@ -1180,25 +1256,27 @@ async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, can
         }
     }
 
-    // Pass 4 (Page-level Fallback): หากระยะทางเกิน แต่ในหน้านั้นมีภาพประกอบจริง ให้ดึงภาพที่ดีที่สุดบนหน้ามาใช้งานทันที
-    const allPageIllustrations = blocks.filter(b => {
-        const area = b.w * b.h;
-        const areaFraction = area / pageArea;
-        const isIll = b.kind === 'image' || b.source === 'pdf-object' || (b.kind === 'mixed' && (b.textCoverage === undefined || b.textCoverage <= 0.40));
-        return isIll && areaFraction <= MAX_ILLUSTRATION_FRACTION && area >= 2500;
-    }).sort((a, b) => {
-        const cA = getRectCenter(a), cB = getRectCenter(b);
-        const distA = Math.hypot(cA.x - center.x, cA.y - center.y);
-        const distB = Math.hypot(cB.x - center.x, cB.y - center.y);
-        return distA - distB || (b.w * b.h) - (a.w * a.h);
-    });
-
-    if (allPageIllustrations.length > 0) {
-        console.log('[Smart Crop] Page-level fallback: selected best illustration on page', {
-            size: `${Math.round(allPageIllustrations[0].w)}x${Math.round(allPageIllustrations[0].h)}`,
-            source: allPageIllustrations[0].source || 'layout'
+    // Pass 4: Page-level Fallback เฉพาะเมื่อข้อความสรุปพูดถึงภาพ/กราฟ/ไดอะแกรมโดยตรง
+    if (textMentionsVisual) {
+        const allPageIllustrations = blocks.filter(b => {
+            const area = b.w * b.h;
+            const areaFraction = area / pageArea;
+            const isIll = b.kind === 'image' || b.source === 'pdf-object' || (b.kind === 'mixed' && (b.textCoverage === undefined || b.textCoverage <= 0.40));
+            return isIll && areaFraction <= MAX_ILLUSTRATION_FRACTION && area >= 2500;
+        }).sort((a, b) => {
+            const cA = getRectCenter(a), cB = getRectCenter(b);
+            const distA = Math.hypot(cA.x - center.x, cA.y - center.y);
+            const distB = Math.hypot(cB.x - center.x, cB.y - center.y);
+            return distA - distB || (b.w * b.h) - (a.w * a.h);
         });
-        return allPageIllustrations[0];
+
+        if (allPageIllustrations.length > 0) {
+            console.log('[Smart Crop] Page-level fallback: selected best illustration on page', {
+                size: `${Math.round(allPageIllustrations[0].w)}x${Math.round(allPageIllustrations[0].h)}`,
+                source: allPageIllustrations[0].source || 'layout'
+            });
+            return allPageIllustrations[0];
+        }
     }
 
     return null;
@@ -1206,35 +1284,63 @@ async function findBestIllustrationWithRetries(pageNum, textRegion, canvasW, can
 
 // เมื่อไม่มีภาพประกอบ ให้กรอบเป็น "ย่อหน้าบริบท" ทั้งบล็อก ไม่ใช่แค่หัวข้อ/หนึ่งบรรทัด
 async function buildArticleContextRegion(pageNum, anchor, viewport) {
+    if (!anchor) return null;
     const page = await pdfDoc.getPage(pageNum);
     const content = await page.getTextContent();
     const anchorCenter = getRectCenter(anchor);
-    const maxColumnDistance = Math.max(viewport.width * 0.20, 190);
-    const minY = Math.max(0, anchor.y - Math.max(28, anchor.h * 1.5));
-    const maxY = Math.min(viewport.height, anchor.y + Math.max(viewport.height * 0.34, 260));
+
+    // ถ้า anchor มีขนาดบล็อกชัดเจน (หลายบรรทัด) อยู่แล้ว ให้ตีกรอบตรงจุดนั้นพร้อม padding สวยงาม
+    if (anchor.h >= 36 && anchor.w >= 160) {
+        const paddingX = 14, paddingY = 10;
+        return clampRegionToCanvas({
+            x: anchor.x - paddingX,
+            y: anchor.y - paddingY,
+            w: anchor.w + paddingX * 2,
+            h: anchor.h + paddingY * 2
+        }, viewport.width, viewport.height);
+    }
+
+    const maxColumnDistance = Math.max(viewport.width * 0.18, 160);
+    const minY = Math.max(0, anchor.y - Math.max(16, anchor.h));
+    const maxY = Math.min(viewport.height, anchor.y + Math.max(viewport.height * 0.24, 190));
     const items = content.items.map(item => getTextItemRect(item, viewport)).filter(rect => {
         const c = getRectCenter(rect);
         // PDF บางไฟล์รวมทั้งบรรทัดเป็น text item เดียว จึงใช้การทับกับ lane ของคอลัมน์
-        // แทนการใช้จุดกึ่งกลางอย่างเดียว (ซึ่งจะทิ้งบรรทัดเนื้อหาที่ยาว)
         const overlapsAnchorColumn = rect.x <= anchorCenter.x + maxColumnDistance &&
             rect.x + rect.w >= anchorCenter.x - maxColumnDistance;
         return c.y >= minY && c.y <= maxY && overlapsAnchorColumn;
     }).sort((a, b) => a.y - b.y || a.x - b.x);
 
-    if (!items.length) return { ...anchor };
-    // จำกัดถึงประมาณ 14 บรรทัดหรือจนถึงช่องว่างแนวตั้งใหญ่ ซึ่งมักเป็นหัวข้อถัดไป
+    if (!items.length) {
+        const paddingX = 14, paddingY = 10;
+        return clampRegionToCanvas({
+            x: anchor.x - paddingX,
+            y: anchor.y - paddingY,
+            w: anchor.w + paddingX * 2,
+            h: anchor.h + paddingY * 2
+        }, viewport.width, viewport.height);
+    }
+
+    // จำกัดอยู่ในย่อหน้าเดียวกัน ไม่ล้นไปยังย่อหน้าหรือหัวข้อถัดไป
     const selected = [];
     let previousY = null;
     for (const rect of items) {
-        if (previousY !== null && rect.y - previousY > Math.max(55, anchor.h * 3) && selected.length >= 3) break;
+        if (previousY !== null) {
+            const gapY = rect.y - previousY;
+            if (gapY > 26 && selected.length >= 2) break; // Paragraph break
+        }
         selected.push(rect);
         previousY = rect.y;
-        if (selected.length >= 14) break;
+        if (selected.length >= 7) break;
     }
     let region = createUnionRect([anchor, ...selected]) || { ...anchor };
-    const paddingX = 18, paddingY = 14;
-    region = clampRegionToCanvas({ x: region.x - paddingX, y: region.y - paddingY, w: region.w + paddingX * 2, h: region.h + paddingY * 2 }, viewport.width, viewport.height);
-    return region;
+    const paddingX = 14, paddingY = 10;
+    return clampRegionToCanvas({
+        x: region.x - paddingX,
+        y: region.y - paddingY,
+        w: region.w + paddingX * 2,
+        h: region.h + paddingY * 2
+    }, viewport.width, viewport.height);
 }
 
 function expandRegionWithLayoutBlocks(pageNum, region, canvasWidth = 0, canvasHeight = 0) {
@@ -1511,6 +1617,7 @@ async function checkAndFilterLiImages(items) {
     function extractTerms(text) {
         const terms = [];
         if (!text) return terms;
+        const STOPWORDS = new Set(['the', 'and', 'of', 'to', 'in', 'for', 'on', 'with', 'as', 'by', 'at', 'an', 'be', 'this', 'that', 'from', 'or', 'is', 'it', 'are', 'was', 'were', 'been', 'has', 'have', 'had', 'but', 'not', 'a', 'its', 'into', 'all', 'can', 'will']);
         // 1. Text inside parentheses: "(Roof Pitch, Slope, 6-in-12 Pitch)"
         const pMatches = text.match(/\(([^)]+)\)/g) || [];
         for (const pm of pMatches) {
@@ -1650,6 +1757,75 @@ function clusterMatches(matches) {
     return clusters;
 }
 
+// ค้นหาวลีหรือประโยคที่มีหลายคำต่อเนื่องกันในเนื้อหา PDF (Sliding Window Phrase Matcher)
+function findPhraseMatchesOnPage(contentItems, viewport, searchTerms, blocks = []) {
+    const matches = [];
+    if (!contentItems || contentItems.length === 0) return matches;
+
+    const itemsData = contentItems.map(item => {
+        const str = item.str || '';
+        const rect = getTextItemRect(item, viewport);
+        let isNoise = false;
+        if (blocks && blocks.length > 0) {
+            for (const b of blocks) {
+                if (b.kind === 'noise' && getOverlapArea(rect, b) > 0) {
+                    isNoise = true;
+                    break;
+                }
+            }
+        }
+        return {
+            str,
+            norm: normalizeSearchText(str),
+            rect,
+            isNoise
+        };
+    }).filter(it => !it.isNoise);
+
+    for (const term of searchTerms) {
+        if (!term.norm || term.norm.length < 3) continue;
+        const termWords = term.norm.split(/\s+/).filter(w => w.length > 0);
+        if (termWords.length === 0) continue;
+
+        // วลีที่มีหลายคำ หรือคำค้นที่ยาวพอ
+        if (termWords.length >= 2 || term.norm.length >= 6) {
+            for (let i = 0; i < itemsData.length; i++) {
+                let accumulatedNorm = '';
+                const windowItems = [];
+                for (let j = i; j < Math.min(itemsData.length, i + 12); j++) {
+                    const item = itemsData[j];
+                    if (!item.norm) continue;
+
+                    if (windowItems.length > 0) {
+                        const prev = windowItems[windowItems.length - 1];
+                        const dy = Math.abs(item.rect.y - prev.rect.y);
+                        if (dy > 45) break; // บรรทัดห่างเกินกว่าจะเป็นวลีเดียวกัน
+                    }
+
+                    accumulatedNorm += (accumulatedNorm ? ' ' : '') + item.norm;
+                    windowItems.push(item);
+
+                    if (accumulatedNorm.includes(term.norm) || (accumulatedNorm.length >= term.norm.length * 0.85 && term.norm.includes(accumulatedNorm))) {
+                        const unionRect = createUnionRect(windowItems.map(it => it.rect));
+                        if (unionRect) {
+                            const isExact = accumulatedNorm === term.norm || accumulatedNorm.includes(term.norm);
+                            matches.push({
+                                rect: unionRect,
+                                term: term,
+                                exact: isExact,
+                                isPhrase: true,
+                                scoreBonus: (term.weight || 1) * (isExact ? 40 : 20)
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return matches;
+}
+
 async function highlightContextInPDF(rawPayload) {
     if (!pdfDoc || !rawPayload) return null;
 
@@ -1675,28 +1851,29 @@ async function highlightContextInPDF(rawPayload) {
             const page = await pdfDoc.getPage(pageNum);
             const content = await page.getTextContent();
             const viewport = page.getViewport({ scale: scale });
+            const blocks = getPageLayoutBlocksAtScale(pageNum, scale);
             const pageMatches = [];
 
+            // 1. ค้นหาวลีที่มีความแม่นยำสูงแบบหลายคำต่อเนื่อง
+            const phraseMatches = findPhraseMatchesOnPage(content.items, viewport, searchTerms, blocks);
+            pageMatches.push(...phraseMatches);
+
+            // 2. ค้นหาคำแบบรายไอเทม
             for (const item of content.items) {
                 const itemNorm = normalizeSearchText(item.str || '');
                 if (itemNorm.length < 2) continue;
 
-                // Skip matches inside noise layout blocks (like creases, header/footer line decorations)
                 const itemRect = getTextItemRect(item, viewport);
-                const blocks = getPageLayoutBlocksAtScale(pageNum, scale);
-                let isInsideValidBlock = false;
-                if (blocks.length > 0) {
+                let isNoise = false;
+                if (blocks && blocks.length > 0) {
                     for (const block of blocks) {
-                        if (block.kind !== 'noise' && getOverlapArea(itemRect, block) > 0) {
-                            isInsideValidBlock = true;
+                        if (block.kind === 'noise' && getOverlapArea(itemRect, block) > 0) {
+                            isNoise = true;
                             break;
                         }
                     }
-                } else {
-                    isInsideValidBlock = true;
                 }
-
-                if (!isInsideValidBlock) continue;
+                if (isNoise) continue;
 
                 for (const term of searchTerms) {
                     if (!term.norm || term.norm.length < 2) continue;
@@ -1713,7 +1890,8 @@ async function highlightContextInPDF(rawPayload) {
                         pageMatches.push({
                             rect: itemRect,
                             term,
-                            exact
+                            exact,
+                            scoreBonus: 0
                         });
                         break;
                     }
@@ -1725,12 +1903,14 @@ async function highlightContextInPDF(rawPayload) {
             let sumWeight = 0;
             const uniqueTermsSet = new Set();
             let exactHits = 0;
+            let phraseBonus = 0;
             for (const m of pageMatches) {
                 sumWeight += m.term.weight || 1;
                 uniqueTermsSet.add(m.term.raw);
                 if (m.exact) exactHits++;
+                if (m.scoreBonus) phraseBonus += m.scoreBonus;
             }
-            const score = (sumWeight * 15) + (uniqueTermsSet.size * 25) + (exactHits * 10);
+            const score = (sumWeight * 15) + (uniqueTermsSet.size * 25) + (exactHits * 10) + phraseBonus;
 
             if (score > bestPageScore) {
                 bestPageScore = score;
@@ -1773,7 +1953,7 @@ async function highlightContextInPDF(rawPayload) {
                     if (gap.x < 120 && gap.y < 80) {
                         c.matches.push(match);
                         c.bounds = createUnionRect([c.bounds, match.rect]) || c.bounds;
-                        c.score += match.term.weight || 1;
+                        c.score += (match.term.weight || 1) + (match.scoreBonus || 0);
                         added = true;
                         break;
                     }
@@ -1782,7 +1962,7 @@ async function highlightContextInPDF(rawPayload) {
                     clusters.push({
                         matches: [match],
                         bounds: { ...match.rect },
-                        score: match.term.weight || 1
+                        score: (match.term.weight || 1) + (match.scoreBonus || 0)
                     });
                 }
             }
@@ -1797,17 +1977,18 @@ async function highlightContextInPDF(rawPayload) {
 
         if (!regionToDraw) return highlightTextInPDF(payload.primary || searchTerms[0]?.raw || payload.text || '');
 
-        // Image-first แบบยืนยันด้วยพิกเซลจริงและ retry หลายระยะค้นหา
-        // ห้ามรวมพื้นที่ว่างระหว่างคำกับภาพ เพราะทำให้กรอบดูเหมือนไม่ติดภาพ
+        // ตรวจสอบว่าสรุปข้อความนี้กล่าวถึงภาพประกอบ/กราฟ/ไดอะแกรม หรือไม่
+        const textMentionsVisual = /ภาพ|รูป|กราฟ|ไดอะแกรม|ผัง|ตาราง|chart|figure|fig\b|image|diagram|illustration|pattern|breakout/i.test(payload.text || '');
+
         let bestImageBlock = await findBestIllustrationWithRetries(
             bestPageNum, regionToDraw,
-            bestPageViewport.width, bestPageViewport.height
+            bestPageViewport.width, bestPageViewport.height,
+            textMentionsVisual
         );
 
         let expanded;
         if (bestImageBlock) {
             // เลือกภาพเฉพาะส่วนที่ <li> นั้นกำลังอ่านสรุปอยู่
-            // ถ้าภาพเป็นผัง/ไดอะแกรมรวมขนาดใหญ่ ให้เจาะจงเฉพาะส่วนที่สัมพันธ์กับ regionToDraw (จุดที่พบข้อความ/หัวข้อของ li)
             if (regionToDraw) {
                 const padX = Math.max(140, Math.min(bestImageBlock.w * 0.45, regionToDraw.w * 1.6));
                 const padY = Math.max(110, Math.min(bestImageBlock.h * 0.45, regionToDraw.h * 2.8));
@@ -1830,35 +2011,25 @@ async function highlightContextInPDF(rawPayload) {
                     }, bestPageViewport.width, bestPageViewport.height);
                     console.log('[Smart Crop] Specific illustration part for this <li>:', Math.round(expanded.w) + 'x' + Math.round(expanded.h));
                 } else {
-                    const union = createUnionRect([bestImageBlock, regionToDraw]) || bestImageBlock;
                     expanded = clampRegionToCanvas({
-                        x: union.x - 18,
-                        y: union.y - 18,
-                        w: union.w + 36,
-                        h: union.h + 36
+                        x: bestImageBlock.x - 16,
+                        y: bestImageBlock.y - 16,
+                        w: bestImageBlock.w + 32,
+                        h: bestImageBlock.h + 32
                     }, bestPageViewport.width, bestPageViewport.height);
                 }
             } else {
                 expanded = clampRegionToCanvas({
-                    x: bestImageBlock.x - 18,
-                    y: bestImageBlock.y - 18,
-                    w: bestImageBlock.w + 36,
-                    h: bestImageBlock.h + 36
+                    x: bestImageBlock.x - 16,
+                    y: bestImageBlock.y - 16,
+                    w: bestImageBlock.w + 32,
+                    h: bestImageBlock.h + 32
                 }, bestPageViewport.width, bestPageViewport.height);
             }
         } else {
             expanded = await buildArticleContextRegion(bestPageNum, regionToDraw, bestPageViewport);
             console.log('[Smart Crop] no verified illustration; using article-context fallback');
         }
-
-        // Preserve the actual image/text target separately from the viewport
-        // overlay used for scrolling and visual focus.
-        window.lastFocusedRegion = {
-            pageNum: bestPageNum,
-            region: { ...expanded },
-            viewportWidth: bestPageViewport.width,
-            viewportHeight: bestPageViewport.height
-        };
 
         // Get wrapper for canvas clamping
         const wrapper = document.getElementById(`page-wrapper-${bestPageNum}`);
@@ -1880,12 +2051,8 @@ async function highlightContextInPDF(rawPayload) {
             const contEl = document.getElementById('pdfContainer');
             const vpW = contEl ? contEl.clientWidth : 800;
             const vpH = contEl ? contEl.clientHeight : 600;
-            // คำนวณ zoom จากขนาดexpanded เทียบกับ viewport โดยตรง
-            // expanded.w/h อยู่ใน canvas pixels ที่ prevScale → ต้องหารด้วย prevScale ก่อน
-            // เพื่อให้ได้ขนาด PDF points แล้วคูณด้วย scale ใหม่
             const expandedPtsW = expanded.w / prevScale;
             const expandedPtsH = expanded.h / prevScale;
-            // scale ที่ทำให้ expanded ครอบ 80% ของ viewport
             const fitW = (vpW * 0.80) / expandedPtsW;
             const fitH = (vpH * 0.80) / expandedPtsH;
             scale = Math.max(0.75, Math.min(3.0, Math.min(fitW, fitH)));
@@ -1895,19 +2062,34 @@ async function highlightContextInPDF(rawPayload) {
             const refreshedWrapper = document.getElementById(`page-wrapper-${bestPageNum}`);
             finalCanvas = refreshedWrapper ? refreshedWrapper.querySelector('canvas') : finalCanvas;
 
+            // ปรับขนาดพิกัด expanded ให้ตรงกับ scale ใหม่ของ canvas
+            if (Math.abs(zoomRatio - 1) > 0.01) {
+                expanded = {
+                    x: expanded.x * zoomRatio,
+                    y: expanded.y * zoomRatio,
+                    w: expanded.w * zoomRatio,
+                    h: expanded.h * zoomRatio
+                };
+                focusTargetCenter = {
+                    x: expanded.x + expanded.w / 2,
+                    y: expanded.y + expanded.h / 2
+                };
+            }
+
             // Re-check illustration after page re-render to ensure image focus
-            if (!bestImageBlock) {
+            if (!bestImageBlock && textMentionsVisual) {
                 bestImageBlock = await findBestIllustrationWithRetries(
                     bestPageNum, regionToDraw,
                     finalCanvas ? finalCanvas.width : bestPageViewport.width,
-                    finalCanvas ? finalCanvas.height : bestPageViewport.height
+                    finalCanvas ? finalCanvas.height : bestPageViewport.height,
+                    textMentionsVisual
                 );
                 if (bestImageBlock) {
                     expanded = clampRegionToCanvas({
-                        x: bestImageBlock.x - 18,
-                        y: bestImageBlock.y - 18,
-                        w: bestImageBlock.w + 36,
-                        h: bestImageBlock.h + 36
+                        x: bestImageBlock.x - 16,
+                        y: bestImageBlock.y - 16,
+                        w: bestImageBlock.w + 32,
+                        h: bestImageBlock.h + 32
                     }, finalCanvas ? finalCanvas.width : bestPageViewport.width, finalCanvas ? finalCanvas.height : bestPageViewport.height);
                     focusTargetCenter = {
                         x: bestImageBlock.x + bestImageBlock.w / 2,
@@ -1919,52 +2101,19 @@ async function highlightContextInPDF(rawPayload) {
         }
 
         window.lastHighlightPageNum = bestPageNum;
+        window.lastHighlightRegion = { ...expanded };
+        window.lastFocusedRegion = {
+            pageNum: bestPageNum,
+            region: { ...expanded },
+            viewportWidth: finalCanvas ? finalCanvas.width : bestPageViewport.width,
+            viewportHeight: finalCanvas ? finalCanvas.height : bestPageViewport.height
+        };
 
-        // Helper: คำนวณ viewport region จาก container ∩ canvas
-        function calcViewportRegion() {
-            var cont = document.getElementById('pdfContainer');
-            var wrap = document.getElementById('page-wrapper-' + bestPageNum);
-            var cv = wrap ? wrap.querySelector('canvas') : null;
-            if (!cv && cont) cv = cont.querySelector('.pdf-canvas-item');
-            if (!cont || !cv) return null;
-            var cR = cont.getBoundingClientRect();
-            var aR = cv.getBoundingClientRect();
-            if (!aR.width || !aR.height) return null;
-            var vL = Math.max(cR.left, aR.left);
-            var vT = Math.max(cR.top, aR.top);
-            var vR = Math.min(cR.right, aR.right);
-            var vB = Math.min(cR.bottom, aR.bottom);
-            if (vR <= vL || vB <= vT) return null;
-            var sx = cv.width / aR.width;
-            var sy = cv.height / aR.height;
-            var vp = {
-                x: (vL - aR.left) * sx, y: (vT - aR.top) * sy,
-                w: (vR - vL) * sx, h: (vB - vT) * sy
-            };
-            if (vp.w < 10 || vp.h < 10) return null;
-            return vp;
-        }
+        // วาดกรอบแดงครอบ expanded region โดยตรง (ไม่ถูกแทนที่ด้วย viewport)
+        const overlay = drawContextHighlight(bestPageNum, expanded);
 
-        // Helper: re-position overlay + update lastHighlightRegion
-        function syncOverlayToViewport() {
-            var vp = calcViewportRegion();
-            if (!vp) return false;
-            window.lastHighlightRegion = vp;
-            var wrap = document.getElementById('page-wrapper-' + bestPageNum);
-            if (wrap && overlay) repositionOverlay(overlay, wrap, vp);
-            return true;
-        }
-
-        // Step 9: วาด overlay = viewport (รอ layout settle ก่อน)
-        window.lastHighlightRegion = null;
-        const overlay = drawContextHighlight(bestPageNum, { x: 0, y: 0, w: 1, h: 1 });
-
-        // Synchronous fallback: คำนวณ viewport ทันที ถ้า async ไม่ทัน
-        syncOverlayToViewport();
-
-        // Step 10: รอ layout settle → คำนวณ viewport จริง → scroll → re-position
         if (overlay) {
-            const delay = highlightContextRecursion > 0 ? 450 : 150;
+            const delay = highlightContextRecursion > 0 ? 300 : 100;
             requestAnimationFrame(function () {
                 setTimeout(() => {
                     try {
@@ -1975,10 +2124,10 @@ async function highlightContextInPDF(rawPayload) {
                             return;
                         }
 
-                        // คำนวณ viewport จริงหลัง layout settle
-                        syncOverlayToViewport();
+                        // จัดตำแหน่ง overlay ให้ครอบ expanded region อย่างแม่นยำ
+                        repositionOverlay(overlay, wrap, expanded);
 
-                        // Scroll ให้จุดโฟกัสภาพประกอบ (หรือย่อหน้า) อยู่กึ่งกลางจอเป็นอันดับแรก
+                        // Scroll ให้จุดโฟกัสภาพประกอบ (หรือย่อหน้า) อยู่กึ่งกลางจอ
                         const canv = wrap.querySelector('canvas');
                         if (!canv) return;
                         const scX = canv.clientWidth / canv.width;
@@ -1987,8 +2136,8 @@ async function highlightContextInPDF(rawPayload) {
                         const canvOffY = canv.offsetTop;
                         const wrapR = wrap.getBoundingClientRect();
                         const contR = cont.getBoundingClientRect();
-                        const contentCtrX = wrapR.left + canvOffX + (focusTargetCenter.x * zoomRatio * scX);
-                        const contentCtrY = wrapR.top + canvOffY + (focusTargetCenter.y * zoomRatio * scY);
+                        const contentCtrX = wrapR.left + canvOffX + (focusTargetCenter.x * scX);
+                        const contentCtrY = wrapR.top + canvOffY + (focusTargetCenter.y * scY);
                         const contCenterX = contR.left + contR.width / 2;
                         const contCenterY = contR.top + contR.height / 2;
 
@@ -2002,7 +2151,9 @@ async function highlightContextInPDF(rawPayload) {
                                     left: Math.max(0, targetScrollLeft),
                                     behavior: 'smooth'
                                 });
-                                setTimeout(() => { syncOverlayToViewport(); }, 350);
+                                setTimeout(() => {
+                                    if (overlay && wrap) repositionOverlay(overlay, wrap, expanded);
+                                }, 350);
                             } catch (_) {}
                         };
 
@@ -2418,68 +2569,252 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
     const script = `
     (function() {
-        if (window.geminiScriptInjected) {
-            console.log('Script already exists');
-            return;
-        }
+        try {
+            if (window.__geminiCheckStatusTimer) {
+                clearInterval(window.__geminiCheckStatusTimer);
+                window.__geminiCheckStatusTimer = null;
+            }
+            if (window.__geminiBodyObserver) {
+                window.__geminiBodyObserver.disconnect();
+                window.__geminiBodyObserver = null;
+            }
+            if (window.__focusWheelHandler) {
+                document.removeEventListener('wheel', window.__focusWheelHandler, true);
+                window.__focusWheelHandler = null;
+            }
+        } catch (_) {}
         
         try {
+            if (window.trustedTypes && window.trustedTypes.createPolicy) {
+                try {
+                    if (!window.trustedTypes.defaultPolicy) {
+                        window.trustedTypes.createPolicy('default', {
+                            createHTML: function(s) { return s; },
+                            createScript: function(s) { return s; },
+                            createScriptURL: function(s) { return s; }
+                        });
+                    }
+                } catch (_) {}
+            }
             console.log('Injecting Gemini Helper with Focus Mode (V1 + Wacom)...');
             
             // Initialize Reading State
             window.readingComplete = true;
             window.__hasOverlay__ = true;
             if (window.__isPrefetchWebview === undefined) window.__isPrefetchWebview = false;
+            // Reset TTS state so stale __isTtsPlaying never blocks a fresh speakLi call
+            window.__isTtsPlaying = false;
+            window.__currentTtsLi = null;
+            window.__pendingMoveAfterTts = null;
+            window.__autoAdvanceTimer = null;
             
+            // Disable native window desktop notifications completely
+            try {
+                if (window.Notification) {
+                    window.Notification = function() {
+                        return {
+                            close: function() {},
+                            addEventListener: function() {},
+                            removeEventListener: function() {},
+                            dispatchEvent: function() { return false; }
+                        };
+                    };
+                    window.Notification.permission = 'denied';
+                    window.Notification.requestPermission = function() {
+                        return Promise.resolve('denied');
+                    };
+                }
+            } catch (_) {}
+
             if (!window.chrome) window.chrome = {};
             
             var lastMouseX = 0;
             var lastMouseY = 0;
+            var lastMouseMoveTime = Date.now();
+            function recordUserActivity() {
+                lastMouseMoveTime = Date.now();
+                if (window.__autoAdvanceTimer) {
+                    clearTimeout(window.__autoAdvanceTimer);
+                    window.__autoAdvanceTimer = null;
+                }
+            }
             document.addEventListener('mousemove', function(e) {
                 lastMouseX = e.clientX;
                 lastMouseY = e.clientY;
+                recordUserActivity();
             }, true);
+            ['wheel', 'keydown', 'mousedown', 'touchstart'].forEach(function(evt) {
+                document.addEventListener(evt, recordUserActivity, { passive: true, capture: true });
+            });
+            window.__onExternalMouseMove = recordUserActivity;
             if (!window.chrome.runtime) window.chrome.runtime = { sendMessage: function(){}, onMessage: { addListener: function(){} } };
             
             function addFocusStyles() {
-                if (document.getElementById('gemini-focus-styles')) return;
+                var style = document.getElementById('gemini-focus-styles');
+                if (!style) {
+                    style = document.createElement('style');
+                    style.id = 'gemini-focus-styles';
+                    document.head.appendChild(style);
+                }
                 const css = \`
-                    .focus-response-container { position: relative; z-index: 1; }
-                    .focus-response-container li { display: block; transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1); opacity: 0.88; filter: none; border-left: 3px solid transparent; padding: 10px 16px; margin-bottom: 10px; border-radius: 8px; font-family: inherit; font-size: 1rem; line-height: 1.8; color: #e2e8f0; }
-                    .focus-response-container li.active-focus { opacity: 1; filter: none; transform: scale(1.01) translateX(4px); background: linear-gradient(145deg, #1e293b, #0f172a); border: 1px solid rgba(249, 115, 22, 0.35); list-style: none; color: #f8fafc !important; font-weight: 400; text-shadow: 0 1px 2px rgba(0,0,0,0.5); box-shadow: 0 4px 10px -1px rgba(0, 0, 0, 0.5), 0 0 14px rgba(249, 115, 22, 0.18); border-radius: 12px; z-index: 100; position: relative; }
-                    .focus-response-container li .thai-keyword { color: #fb923c !important; font-weight: 700 !important; }
-                    .focus-response-container li.active-focus .thai-keyword { color: #fdba74 !important; font-weight: 700 !important; background: rgba(251, 146, 60, 0.15) !important; padding: 1px 5px !important; border-radius: 4px !important; }
+                    .focus-response-container { position: relative !important; z-index: 1 !important; }
+                    .focus-response-container li,
+                    message-content li,
+                    .model-response-text li,
+                    [data-test-id="model-response"] li,
+                    [class*="canvas"] li,
+                    [class*="artifact"] li,
+                    .ql-editor li {
+                        display: block !important;
+                        position: relative !important;
+                        transition: all 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+                        opacity: 0.88;
+                        filter: none;
+                        border-left: 3px solid transparent;
+                        padding: 12px 18px !important;
+                        margin-bottom: 12px !important;
+                        border-radius: 10px !important;
+                        font-family: inherit;
+                        font-size: 1rem;
+                        line-height: 1.8;
+                        color: #e2e8f0;
+                    }
+                    .focus-response-container li.active-focus,
+                    li.active-focus {
+                        opacity: 1 !important;
+                        filter: none !important;
+                        transform: scale(1.01) translateX(4px) !important;
+                        background: linear-gradient(145deg, #1e293b, #0f172a) !important;
+                        border: 1px solid rgba(249, 115, 22, 0.4) !important;
+                        list-style: none !important;
+                        color: #f8fafc !important;
+                        font-weight: 400;
+                        text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+                        box-shadow: 0 4px 12px -1px rgba(0, 0, 0, 0.5), 0 0 16px rgba(249, 115, 22, 0.2) !important;
+                        border-radius: 12px !important;
+                        z-index: 100 !important;
+                        position: relative !important;
+                    }
+                    .focus-response-container li .thai-keyword, li .thai-keyword { color: #fb923c !important; font-weight: 700 !important; }
+                    .focus-response-container li.active-focus .thai-keyword, li.active-focus .thai-keyword { color: #fdba74 !important; font-weight: 700 !important; background: rgba(251, 146, 60, 0.15) !important; padding: 1px 5px !important; border-radius: 4px !important; }
                     .focus-response-container li strong:not(.thai-keyword),
-                    .focus-response-container li b:not(.thai-keyword) { color: inherit !important; background: transparent !important; }
-                    .focus-response-container li.active-focus::marker { color: #fb923c !important; }
+                    .focus-response-container li b:not(.thai-keyword),
+                    li strong:not(.thai-keyword), li b:not(.thai-keyword) { color: inherit !important; background: transparent !important; }
+                    li.active-focus::marker { color: #fb923c !important; }
                     .active-focus .copy-btn-container { opacity: 1 !important; }
-                    .focus-response-container li.active-focus .li-save-btn { opacity: 0.8 !important; }
-                    .focus-response-container li .li-save-btn:hover { opacity: 1 !important; background: rgba(249,115,22,0.18) !important; border-color: rgba(249,115,22,0.5) !important; }
-                    .focus-response-container li.tts-speaking-li { border-left: 3px solid #22c55e !important; background: rgba(34, 197, 94, 0.06) !important; position: relative !important; }
-                    .focus-response-container li .tts-ch-active { background: rgba(34, 197, 94, 0.4) !important; border-radius: 3px !important; color: #fff !important; text-shadow: 0 0 8px rgba(34,197,94,0.5) !important; }
-                    .focus-response-container li .tts-ch { transition: background 0.15s ease, color 0.15s ease; }
+                    li.active-focus .li-save-btn { opacity: 0.8 !important; }
+                    li .li-save-btn:hover { opacity: 1 !important; background: rgba(249,115,22,0.18) !important; border-color: rgba(249,115,22,0.5) !important; }
+                    li.tts-speaking-li { border-left: 3px solid #22c55e !important; background: rgba(34, 197, 94, 0.08) !important; position: relative !important; }
+                    li .tts-ch-active { background: rgba(34, 197, 94, 0.4) !important; border-radius: 3px !important; color: #fff !important; text-shadow: 0 0 8px rgba(34,197,94,0.5) !important; }
+                    li .tts-ch { transition: background 0.15s ease, color 0.15s ease; }
 
-                    .tts-progress-track { position: absolute; bottom: 0; left: 0; right: 0; height: 5px; background: rgba(15, 23, 42, 0.7); overflow: hidden; z-index: 1000; pointer-events: none; border-radius: 0 0 10px 10px; transition: opacity 0.3s ease; }
-                    .tts-progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #10b981, #22c55e, #4ade80); box-shadow: 0 0 10px rgba(34, 197, 94, 0.9); transition: width 0.08s linear; border-radius: 2px; }
-                    .tts-progress-loading { height: 5px !important; }
-                    .tts-progress-loading .tts-progress-fill { width: 100% !important; background: linear-gradient(90deg, rgba(34,197,94,0.1) 0%, rgba(34,197,94,0.95) 50%, rgba(56,189,248,0.95) 75%, rgba(34,197,94,0.1) 100%) !important; background-size: 200% 100% !important; animation: ttsLoadingShimmer 0.9s infinite linear !important; box-shadow: 0 0 12px rgba(34, 197, 94, 0.9) !important; }
+                    /* Progress Bar Track on the Active li */
+                    .tts-progress-track {
+                        position: absolute !important;
+                        bottom: 0 !important;
+                        left: 0 !important;
+                        right: 0 !important;
+                        height: 6px !important;
+                        background: rgba(15, 23, 42, 0.8) !important;
+                        overflow: hidden !important;
+                        z-index: 1000 !important;
+                        pointer-events: none !important;
+                        border-radius: 0 0 12px 12px !important;
+                        transition: opacity 0.3s ease !important;
+                    }
+                    .tts-progress-fill {
+                        height: 100% !important;
+                        width: 0%;
+                        background: linear-gradient(90deg, #10b981, #22c55e, #38bdf8) !important;
+                        box-shadow: 0 0 12px rgba(34, 197, 94, 0.95), 0 0 4px rgba(56, 189, 248, 0.8) !important;
+                        transition: width 0.08s linear !important;
+                        border-radius: 2px !important;
+                    }
+                    .tts-progress-loading .tts-progress-fill {
+                        position: relative !important;
+                        background: linear-gradient(90deg, #10b981, #06b6d4, #3b82f6) !important;
+                        box-shadow: 0 0 14px rgba(6, 182, 212, 0.9) !important;
+                    }
+                    .tts-progress-loading .tts-progress-fill::after {
+                        content: '' !important;
+                        position: absolute !important;
+                        top: 0 !important; left: 0 !important; right: 0 !important; bottom: 0 !important;
+                        background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.7) 50%, transparent 100%) !important;
+                        background-size: 200% 100% !important;
+                        animation: ttsLoadingShimmer 1.1s infinite linear !important;
+                    }
 
-                    #tts-global-progress { position: fixed; top: 0; left: 0; right: 0; height: 4px; z-index: 999999; pointer-events: none; opacity: 0; transition: opacity 0.25s ease; background: rgba(15, 23, 42, 0.4); }
+                    /* Floating Badge: ⏳ กำลังเตรียมเสียงอ่าน... */
+                    .tts-loading-badge {
+                        position: absolute !important;
+                        bottom: 10px !important;
+                        right: 14px !important;
+                        display: inline-flex !important;
+                        align-items: center !important;
+                        gap: 6px !important;
+                        background: rgba(15, 23, 42, 0.92) !important;
+                        border: 1px solid rgba(34, 197, 94, 0.65) !important;
+                        box-shadow: 0 2px 10px rgba(0, 0, 0, 0.6), 0 0 12px rgba(34, 197, 94, 0.35) !important;
+                        color: #4ade80 !important;
+                        font-size: 11.5px !important;
+                        font-weight: 600 !important;
+                        padding: 3px 10px !important;
+                        border-radius: 12px !important;
+                        z-index: 1001 !important;
+                        pointer-events: none !important;
+                        letter-spacing: 0.2px !important;
+                        transition: opacity 0.25s ease, transform 0.25s ease !important;
+                        animation: ttsBadgePulse 1.3s infinite ease-in-out !important;
+                    }
+                    .tts-loading-badge .tts-badge-icon {
+                        display: inline-block !important;
+                        font-size: 12px !important;
+                        animation: ttsSpin 2s infinite linear !important;
+                    }
+
+                    @keyframes ttsBadgePulse {
+                        0%, 100% { transform: scale(1); opacity: 0.92; }
+                        50% { transform: scale(1.04); opacity: 1; box-shadow: 0 2px 14px rgba(34, 197, 94, 0.6); }
+                    }
+                    @keyframes ttsSpin {
+                        0% { transform: rotate(0deg); }
+                        100% { transform: rotate(360deg); }
+                    }
+                    @keyframes ttsLoadingShimmer {
+                        0% { transform: translateX(-100%); }
+                        100% { transform: translateX(100%); }
+                    }
+
+                    #tts-global-progress { position: fixed; top: 0; left: 0; right: 0; height: 4px; z-index: 999999; pointer-events: none; opacity: 0; transition: opacity 0.25s ease; background: rgba(15, 23, 42, 0.5); }
                     #tts-global-progress.active { opacity: 1; }
                     #tts-global-progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg, #10b981, #22c55e, #38bdf8); box-shadow: 0 0 12px rgba(34, 197, 94, 0.95); transition: width 0.08s linear; }
-                    #tts-global-progress.loading #tts-global-progress-fill { width: 100% !important; background: linear-gradient(90deg, rgba(34,197,94,0.1) 0%, rgba(34,197,94,0.95) 50%, rgba(56,189,248,0.95) 75%, rgba(34,197,94,0.1) 100%) !important; background-size: 200% 100% !important; animation: ttsLoadingShimmer 0.9s infinite linear !important; }
+                    #tts-global-progress.loading #tts-global-progress-fill { width: 100% !important; background: linear-gradient(90deg, rgba(34,197,94,0.2) 0%, rgba(34,197,94,0.95) 50%, rgba(56,189,248,0.95) 75%, rgba(34,197,94,0.2) 100%) !important; background-size: 200% 100% !important; animation: ttsLoadingShimmer 0.9s infinite linear !important; }
 
-                    @keyframes ttsLoadingShimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+                    /* Suppress Gemini Canvas/Doc promo tooltips, discovery balloons and help overlays */
+                    div[role="tooltip"],
+                    [class*="tooltip"],
+                    [class*="help-bubble"],
+                    [class*="feature-discovery"],
+                    [class*="callout-content"],
+                    [class*="guide-dialog"],
+                    .cdk-overlay-pane:has([role="tooltip"]),
+                    .cdk-overlay-pane:has([class*="bubble"]),
+                    .cdk-overlay-pane:has([class*="tooltip"]) {
+                        pointer-events: none !important;
+                        opacity: 0 !important;
+                        display: none !important;
+                        visibility: hidden !important;
+                    }
                 \`;
-                const style = document.createElement('style');
-                style.id = 'gemini-focus-styles';
                 style.textContent = css;
-                document.head.appendChild(style);
             }
 
             function tagThaiKeywords() {
                 var R = /[ก-๙]/;
-                document.querySelectorAll('message-content li, .model-response-text li, [data-test-id="model-response"] li').forEach(function(li) {
+                var targets = document.querySelectorAll('message-content li, .model-response-text li, [data-test-id="model-response"] li, [class*="canvas"] li, [class*="artifact"] li, .ql-editor li');
+                if (targets.length === 0) targets = document.querySelectorAll('li');
+                targets.forEach(function(li) {
+                    if (li.closest('nav') || li.closest('header') || li.closest('bard-sidenav') || li.closest('side-nav')) return;
                     // 1. Sanitize any double parens in text nodes
                     var walker = document.createTreeWalker(li, NodeFilter.SHOW_TEXT, null, false);
                     var textNode;
@@ -2513,7 +2848,13 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                                 while (eng.indexOf('( (') !== -1) eng = eng.replace('( (', '(');
                                 while (eng.indexOf('))') !== -1) eng = eng.replace('))', ')');
                                 while (eng.indexOf(') )') !== -1) eng = eng.replace(') )', ')');
-                                b.innerHTML = '<span class="thai-keyword" style="color:#fb923c !important;font-weight:700 !important">' + thai + '</span> ' + eng;
+                                var sp = document.createElement('span');
+                                sp.className = 'thai-keyword';
+                                sp.style.cssText = 'color:#fb923c !important;font-weight:700 !important';
+                                sp.textContent = thai;
+                                b.textContent = '';
+                                b.appendChild(sp);
+                                b.appendChild(document.createTextNode(' ' + eng));
                             } else if (R.test(t)) {
                                 b.style.cssText = b.style.cssText + ';color:#fb923c !important;font-weight:700 !important';
                                 b.classList.add('thai-keyword');
@@ -2587,71 +2928,111 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             function getVisibleLis(c) {
                 var root = c;
                 if (!root) {
-                    var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
-                    if (resp.length === 0) return [];
-                    root = resp[resp.length - 1];
+                    var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"], [class*="canvas"], [class*="artifact"], .ql-editor');
+                    if (resp.length > 0) root = resp[resp.length - 1];
                 }
-                return Array.from(root.querySelectorAll('li')).filter(function(l) {
-                    return l.innerText.trim().length > 5 && l.style.display !== 'none';
-                });
+                var list = [];
+                if (root) {
+                    list = Array.from(root.querySelectorAll('li')).filter(function(l) {
+                        return (l.innerText || '').trim().length > 5 && l.style.display !== 'none';
+                    });
+                }
+                if (list.length === 0) {
+                    list = Array.from(document.querySelectorAll('main li, [role="main"] li, li')).filter(function(l) {
+                        return (l.innerText || '').trim().length > 5 &&
+                               l.style.display !== 'none' &&
+                               !l.closest('nav') &&
+                               !l.closest('header') &&
+                               !l.closest('bard-sidenav') &&
+                               !l.closest('side-nav') &&
+                               !l.closest('.side-navigation');
+                    });
+                }
+                return list;
             }
 
             function setupFocusMode() {
                 addFocusStyles();
-                const responses = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
-                if (responses.length === 0) return;
-                const container = responses[responses.length - 1];
+                const responses = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"], [class*="canvas"], [class*="artifact"], .ql-editor');
+                let container = responses.length > 0 ? responses[responses.length - 1] : null;
                 var items = getVisibleLis(container);
-                if (container.dataset.focusInitialized !== 'true') {
-                    if (items.length === 0) return;
-                    container.dataset.focusInitialized = 'true';
-                    container.classList.add('focus-response-container');
-                    container.dataset.focusIndex = '0';
+                if (items.length === 0) return;
+                if (!container) {
+                    container = items[0].closest('ul') || items[0].closest('ol') || items[0].parentElement || document.body;
+                }
+                if (container.dataset && container.dataset.focusInitialized !== 'true') {
+                    if (container.dataset) {
+                        container.dataset.focusInitialized = 'true';
+                        container.classList.add('focus-response-container');
+                        container.dataset.focusIndex = '0';
+                    }
+                    items.forEach(function(li) { attachSaveBtnToLi(li); });
                     items[0].classList.add('active-focus');
+                    items[0].style.position = 'relative';
+                    showTtsProgressBar(items[0]);
                     triggerHighlight(items[0]);
-                    if (window.__ebookOfflineMode || !window.__ttsEnabled) {
+                    if (!window.__ttsEnabled) {
                         setTimeout(function() { items[0].scrollIntoView({ behavior: 'smooth', block: 'center' }); }, 100);
                     }
-                    if (!window.__ebookOfflineMode && !window.__isPrefetchWebview) {
+                    if (!window.__isPrefetchWebview) {
                         speakLi(items[0]);
                     } else if (typeof triggerFastFirstLiRead === 'function') {
                         triggerFastFirstLiRead(items[0]);
                     }
-                    container.addEventListener('wheel', function(e) {
-                        var currentItems = getVisibleLis(container);
-                        if (currentItems.length === 0) return;
-                        var idx = parseInt(container.dataset.focusIndex || '0');
-                        if (e.deltaY > 0) {
-                            if (idx < currentItems.length - 1) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx++; updateFocus(idx); }
-                            else if (window.__ebookOfflineMode) { console.log('__OFFLINE_LAST_LI_WHEEL__'); }
-                        }
-                        else { if (idx > 0) { e.preventDefault(); e.stopPropagation(); currentItems[idx].classList.remove('active-focus'); idx--; updateFocus(idx); } }
-                        function updateFocus(idx) {
-                            currentItems[idx].classList.add('active-focus');
-                            if (window.__ebookOfflineMode || !window.__ttsEnabled) {
-                                currentItems[idx].scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            }
-                            triggerHighlight(currentItems[idx]);
-                            container.dataset.focusIndex = idx.toString();
-                            setTimeout(tagThaiKeywords, 50);
-                            speakLi(currentItems[idx]);
-                        }
-                    }, { passive: false });
+                    setupWheelHandler();
                 } else if (items.length > 0) {
-                    container.querySelectorAll('li').forEach(function(li) { attachSaveBtnToLi(li); });
-                    var syncIdx = parseInt(container.dataset.focusIndex || '0');
+                    items.forEach(function(li) { attachSaveBtnToLi(li); });
+                    var syncIdx = parseInt((container.dataset && container.dataset.focusIndex) || '0');
                     if (syncIdx >= items.length) syncIdx = 0;
                     if (!items[syncIdx].classList.contains('active-focus')) {
                         items[syncIdx].classList.add('active-focus');
                         triggerHighlight(items[syncIdx]);
-                        if (!window.__ebookOfflineMode && !window.__isPrefetchWebview && !ttsState.speakingLi) {
+                        if (!window.__isPrefetchWebview && !ttsState.speakingLi) {
                             speakLi(items[syncIdx]);
                         }
-                    } else if (!window.__ebookOfflineMode && !window.__isPrefetchWebview && !ttsState.speakingLi) {
+                    } else if (!window.__isPrefetchWebview && !ttsState.speakingLi) {
                         speakLi(items[syncIdx]);
                     }
+                    setupWheelHandler();
                 }
+                setupWheelHandler();
                 if (typeof requestLiImageCheck === 'function') requestLiImageCheck();
+                if (typeof ttsPrefetchAllPrompts === 'function') ttsPrefetchAllPrompts();
+            }
+
+            function setupWheelHandler() {
+                if (window.__focusWheelHandler) {
+                    document.removeEventListener('wheel', window.__focusWheelHandler, true);
+                    window.__focusWheelHandler = null;
+                }
+                var wheelLocked = false;
+                window.__focusWheelHandler = function(e) {
+                    if (!e.deltaY || wheelLocked) return;
+                    var fc = document.querySelector('.focus-response-container') ||
+                             document.querySelector('message-content, .model-response-text, [data-test-id="model-response"], [class*="canvas"], [class*="artifact"], .ql-editor') ||
+                             document.body;
+                    if (!fc) return;
+                    var currentItems = getVisibleLis(fc);
+                    if (currentItems.length <= 1) return;
+                    var activeIdx = currentItems.findIndex(function(l) { return l.classList.contains('active-focus'); });
+                    var idx = activeIdx !== -1 ? activeIdx : (parseInt((fc.dataset && fc.dataset.focusIndex) || '0') || 0);
+                    if (idx < 0 || idx >= currentItems.length) idx = 0;
+                    var canNav = (e.deltaY > 0 && idx < currentItems.length - 1) || (e.deltaY < 0 && idx > 0);
+                    if (!canNav) return;
+                    e.preventDefault();
+                    e.stopPropagation();
+                    wheelLocked = true;
+                    setTimeout(function() { wheelLocked = false; }, 140);
+                    currentItems[idx].classList.remove('active-focus');
+                    idx = e.deltaY > 0 ? idx + 1 : idx - 1;
+                    currentItems[idx].classList.add('active-focus');
+                    currentItems[idx].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    triggerHighlight(currentItems[idx]);
+                    if (fc.dataset) fc.dataset.focusIndex = idx.toString();
+                    setTimeout(tagThaiKeywords, 50);
+                    speakLi(currentItems[idx]);
+                };
+                document.addEventListener('wheel', window.__focusWheelHandler, { capture: true, passive: false });
             }
 
             function loadKaTeX() {
@@ -2665,7 +3046,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
             function renderMath() {
                 if (!window.katex || !window.renderMathInElement) return;
-                document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]').forEach(el => {
+                document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"], [class*="canvas"], [class*="artifact"], .ql-editor').forEach(el => {
                     try { window.renderMathInElement(el, { delimiters: [{left: '$$', right: '$$', display: true}, {left: '$', right: '$', display: false}], throwOnError: false }); } catch(e) { }
                 });
             }
@@ -2673,7 +3054,9 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             function createNextPageBtn() {
                 var nextBtn = document.createElement('button');
                 nextBtn.className = 'gemini-next-page-btn';
-                nextBtn.innerHTML = '<span>หน้าถัดไป &gt;</span>';
+                var sp = document.createElement('span');
+                sp.textContent = 'หน้าถัดไป >';
+                nextBtn.appendChild(sp);
                 nextBtn.style.cssText = 'cursor:pointer; background:#2563eb; color:#ffffff; border:none; border-radius:18px; padding:6px 16px; font-size:13px; font-weight:600; margin:4px; display:inline-flex; align-items:center; gap:6px; z-index:9999;';
                 var locked = false;
                 function triggerNext() {
@@ -2695,7 +3078,8 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
             window.updateSaveButtons = function(hasOverlay) {
                 window.__hasOverlay__ = !!hasOverlay;
-                var allLis = document.querySelectorAll('message-content li, .model-response-text li, [data-test-id="model-response"] li');
+                var allLis = document.querySelectorAll('message-content li, .model-response-text li, [data-test-id="model-response"] li, [class*="canvas"] li, [class*="artifact"] li, .ql-editor li');
+                if (allLis.length === 0) allLis = document.querySelectorAll('li');
                 
                 if (window.__hasOverlay__) {
                     allLis.forEach(function(li) {
@@ -2749,8 +3133,8 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 var autoTimer = null;
 
                 function moveToNextLi() {
-                    var c = li.closest('message-content, .model-response-text, [data-test-id="model-response"]');
-                    if (!c) { console.log('__OFFLINE_SEQUENCE_END__'); console.log('__NEXT_PAGE__'); return; }
+                    var c = li.closest('.focus-response-container, message-content, .model-response-text, [data-test-id="model-response"], [class*="canvas"], [class*="artifact"], .ql-editor');
+                    if (!c) c = li.closest('ul, ol') || li.parentElement || document.body;
                     var items = getVisibleLis(c);
                     var idx = items.indexOf(li);
                     if (idx === -1 || idx >= items.length - 1) {
@@ -2839,17 +3223,54 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
                     btn.disabled = true;
                     btn.textContent = '⏳';
-                    btn.style.opacity = '0.4';
+                    btn.style.opacity = '0.5';
+
                     setTimeout(function() {
                         btn.textContent = '✓';
-                        btn.style.opacity = '0.5';
+                        btn.style.opacity = '0.8';
+                        btn.style.color = '#22c55e';
+                    }, 400);
+
+                    if (window.__autoAdvanceTimer) {
+                        clearTimeout(window.__autoAdvanceTimer);
+                        window.__autoAdvanceTimer = null;
+                    }
+
+                    function doAdvance() {
+                        if (btn._hasAdvanced) return;
+                        btn._hasAdvanced = true;
+                        window.__pendingMoveAfterTts = null;
                         moveToNextLi();
-                    }, 1200);
+                    }
+
+                    // ตรวจสอบว่า TTS กำลังอ่าน <li> ปัจจุบันนี้อยู่หรือไม่
+                    var isTtsActiveForThisLi = (window.__isTtsPlaying && window.__currentTtsLi === li) || 
+                                              (ttsState && ttsState.speakingLi === li) || 
+                                              li.classList.contains('tts-speaking-li');
+
+                    if (isTtsActiveForThisLi) {
+                        console.log('[BigData Submit] TTS is currently reading this <li>. Waiting for TTS to finish before advancing...');
+                        window.__pendingMoveAfterTts = function() {
+                            console.log('[BigData Submit] TTS finished reading! Advancing to next <li> now.');
+                            setTimeout(doAdvance, 350);
+                        };
+                        // Safety fallback timer in case audio stalls
+                        setTimeout(function() {
+                            if (!btn._hasAdvanced) {
+                                console.warn('[BigData Submit] Fallback timer reached, advancing.');
+                                doAdvance();
+                            }
+                        }, 25000);
+                    } else {
+                        // TTS อ่านจบไปแล้ว หรือไม่ได้อ่านข้อความนี้ -> ข้ามไป li ถัดไปตามปกติ
+                        setTimeout(doAdvance, 700);
+                    }
                 };
 
                 // Click on li text to speak
                 li.addEventListener('click', function(e) {
                     if (e.target.closest('.li-save-btn, .copy-btn-container, button, a')) return;
+                    window.__pendingMoveAfterTts = null;
                     var c = li.closest('message-content, .model-response-text, [data-test-id="model-response"]');
                     if (c) {
                         var items = getVisibleLis(c);
@@ -2873,10 +3294,21 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
             // --- TTS (Thai, English and numbers; parenthesized annotations are skipped) ---
             var ttsState = { queue: [], speakingLi: null, utterance: null };
+            var ttsFadeTimers = [];
 
             function ttsStop() {
                 if (window.__ttsStop) window.__ttsStop();
-                removeTtsProgressBar();
+                window.__isTtsPlaying = false;
+                window.__currentTtsLi = null;
+                window.__pendingMoveAfterTts = null;
+                if (window.__autoAdvanceTimer) {
+                    clearTimeout(window.__autoAdvanceTimer);
+                    window.__autoAdvanceTimer = null;
+                }
+                if (window.speechSynthesis) {
+                    try { window.speechSynthesis.cancel(); } catch (e) {}
+                }
+                removeTtsProgressBar(true);
                 console.log('__TTS_STOP_EDGE__');
                 if (ttsState.speakingLi) {
                     var li = ttsState.speakingLi;
@@ -2887,15 +3319,67 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             }
 
             function showTtsProgressBar(li) {
-                removeTtsProgressBar();
-                if (li) {
-                    var track = document.createElement('div');
-                    track.className = 'tts-progress-track tts-progress-loading';
-                    var fill = document.createElement('div');
-                    fill.className = 'tts-progress-fill';
-                    track.appendChild(fill);
-                    li.appendChild(track);
+                if (window.__ttsLoadingAnimFrame) {
+                    cancelAnimationFrame(window.__ttsLoadingAnimFrame);
+                    window.__ttsLoadingAnimFrame = null;
                 }
+                // Clear any pending fade removal timers so they never remove the active progress bar
+                ttsFadeTimers.forEach(function(tm) { clearTimeout(tm); });
+                ttsFadeTimers = [];
+
+                // Remove tracks from OTHER elements immediately
+                document.querySelectorAll('.tts-progress-track, .tts-loading-badge').forEach(function(el) {
+                    if (li && (li === el || li.contains(el))) return;
+                    if (el.parentNode) el.parentNode.removeChild(el);
+                });
+
+                if (li) {
+                    li.style.setProperty('position', 'relative', 'important');
+                    
+                    var track = li.querySelector('.tts-progress-track');
+                    var fill = track ? track.querySelector('.tts-progress-fill') : null;
+                    if (!track) {
+                        track = document.createElement('div');
+                        track.className = 'tts-progress-track tts-progress-loading';
+                        track.id = 'active-tts-track';
+                        fill = document.createElement('div');
+                        fill.className = 'tts-progress-fill';
+                        fill.style.width = '8%';
+                        track.appendChild(fill);
+                        li.appendChild(track);
+                    } else {
+                        track.classList.add('tts-progress-loading');
+                        track.style.opacity = '1';
+                        track.style.display = 'block';
+                        if (fill) fill.style.width = '8%';
+                    }
+
+                    var badge = li.querySelector('.tts-loading-badge');
+                    if (!badge) {
+                        badge = document.createElement('div');
+                        badge.className = 'tts-loading-badge';
+                        var icon = document.createElement('span');
+                        icon.className = 'tts-badge-icon';
+                        icon.textContent = '⏳';
+                        badge.appendChild(icon);
+                        badge.appendChild(document.createTextNode(' กำลังเตรียมเสียงอ่าน...'));
+                        li.appendChild(badge);
+                    } else {
+                        badge.style.opacity = '1';
+                        badge.style.display = 'inline-flex';
+                    }
+
+                    var startT = Date.now();
+                    function animLoading() {
+                        if (!track || !track.parentNode || !track.classList.contains('tts-progress-loading')) return;
+                        var elapsed = Date.now() - startT;
+                        var progress = 0.08 + Math.min(0.84, (1 - Math.exp(-elapsed / 1100)) * 0.86);
+                        if (fill) fill.style.width = Math.round(progress * 100) + '%';
+                        window.__ttsLoadingAnimFrame = requestAnimationFrame(animLoading);
+                    }
+                    window.__ttsLoadingAnimFrame = requestAnimationFrame(animLoading);
+                }
+
                 var globalBar = document.getElementById('tts-global-progress');
                 if (!globalBar) {
                     globalBar = document.createElement('div');
@@ -2911,12 +3395,23 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             }
 
             function updateTtsProgress(ratio) {
+                if (window.__ttsLoadingAnimFrame) {
+                    cancelAnimationFrame(window.__ttsLoadingAnimFrame);
+                    window.__ttsLoadingAnimFrame = null;
+                }
                 var pct = Math.min(Math.max(ratio * 100, 0), 100) + '%';
                 var track = document.querySelector('.tts-progress-track');
                 if (track) {
                     track.classList.remove('tts-progress-loading');
+                    track.style.opacity = '1';
                     var fill = track.querySelector('.tts-progress-fill');
                     if (fill) fill.style.width = pct;
+                }
+                var badge = document.querySelector('.tts-loading-badge');
+                if (badge) {
+                    badge.style.opacity = '0';
+                    var bTimer = setTimeout(function() { if (badge && badge.parentNode) badge.parentNode.removeChild(badge); }, 250);
+                    ttsFadeTimers.push(bTimer);
                 }
                 var globalBar = document.getElementById('tts-global-progress');
                 if (globalBar) {
@@ -2927,11 +3422,25 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 }
             }
 
-            function removeTtsProgressBar() {
-                var tracks = document.querySelectorAll('.tts-progress-track');
+            function removeTtsProgressBar(immediate) {
+                if (window.__ttsLoadingAnimFrame) {
+                    cancelAnimationFrame(window.__ttsLoadingAnimFrame);
+                    window.__ttsLoadingAnimFrame = null;
+                }
+                ttsFadeTimers.forEach(function(tm) { clearTimeout(tm); });
+                ttsFadeTimers = [];
+
+                var tracks = document.querySelectorAll('.tts-progress-track, .tts-loading-badge');
                 tracks.forEach(function(t) {
-                    t.style.opacity = '0';
-                    setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 300);
+                    if (immediate) {
+                        if (t.parentNode) t.parentNode.removeChild(t);
+                    } else {
+                        t.style.opacity = '0';
+                        var timer = setTimeout(function() {
+                            if (t.parentNode) t.parentNode.removeChild(t);
+                        }, 250);
+                        ttsFadeTimers.push(timer);
+                    }
                 });
                 var globalBar = document.getElementById('tts-global-progress');
                 if (globalBar) {
@@ -2942,46 +3451,61 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             }
 
             function speakNatural(li) {
-                if (window.__ebookOfflineMode) return;
-                var fullText = li.innerText || '';
-                var thaiText = ttsExtractThai(fullText);
-                if (!thaiText) return;
-                ttsState.speakingLi = li;
-                li.classList.add('tts-speaking-li');
-                ttsSegmentAndWrap(li);
-                showTtsProgressBar(li);
-                console.log('__TTS_EDGE__:' + thaiText);
-                ttsPrefetchNeighbors(li);
-                window.__ttsStart = function(duration) {
-                    if (ttsState.speakingLi) {
-                        try { ttsState.speakingLi.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) {}
-                    }
-                    window.__ttsChars = Array.from(document.querySelectorAll('.tts-ch'));
-                    window.__ttsStartTime = Date.now();
-                    window.__ttsDuration = duration;
-                    function tick() {
-                        var elapsed = (Date.now() - window.__ttsStartTime) / 1000;
-                        var ratio = Math.min(elapsed / window.__ttsDuration, 1);
-                        var idx = Math.floor(ratio * window.__ttsChars.length);
+                try {
+                    if (!li) return;
+                    var rawText = (li.innerText || li.textContent || '');
+                    var fullText = rawText.replace(/กำลังเตรียมเสียงอ่าน\.\.\./g, '')
+                                           .replace(/บันทึกลง Bigdata/g, '')
+                                           .replace(/คัดลอก/g, '')
+                                           .trim();
+                    var thaiText = ttsExtractThai(fullText);
+                    console.log('__TTS_DEBUG__:speakNatural textLen=' + fullText.length + ' thaiLen=' + thaiText.length + ' isPrefetch=' + window.__isPrefetchWebview);
+                    if (!thaiText) { console.log('__TTS_DEBUG__:speakNatural ABORT-empty'); return; }
+                    ttsState.speakingLi = li;
+                    window.__isTtsPlaying = true;
+                    window.__currentTtsLi = li;
+                    li.classList.add('tts-speaking-li');
+                    try { ttsSegmentAndWrap(li); } catch (_) {}
+                    showTtsProgressBar(li);
+                    console.log('__TTS_EDGE__:' + thaiText);
+                    ttsPrefetchNeighbors(li);
+                    window.__ttsStart = function(duration) {
+                        window.__isTtsPlaying = true;
+                        window.__currentTtsLi = li;
+                        if (ttsState.speakingLi) {
+                            try { ttsState.speakingLi.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (_) {}
+                        }
+                        window.__ttsChars = Array.from(document.querySelectorAll('.tts-ch'));
+                        window.__ttsStartTime = Date.now();
+                        window.__ttsDuration = duration;
+                        function tick() {
+                            var elapsed = (Date.now() - window.__ttsStartTime) / 1000;
+                            var ratio = Math.min(elapsed / window.__ttsDuration, 1);
+                            var idx = Math.floor(ratio * window.__ttsChars.length);
+                            document.querySelectorAll('.tts-ch-active').forEach(function(s) { s.classList.remove('tts-ch-active'); });
+                            if (idx >= 0 && idx < window.__ttsChars.length) {
+                                window.__ttsChars[idx].classList.add('tts-ch-active');
+                            }
+                            updateTtsProgress(ratio);
+                            if (ratio < 1) {
+                                window.__ttsTimer = setTimeout(tick, 50);
+                            } else {
+                                setTimeout(removeTtsProgressBar, 300);
+                            }
+                        }
+                        tick();
+                    };
+                    window.__ttsStop = function() {
+                        window.__isTtsPlaying = false;
+                        window.__currentTtsLi = null;
+                        if (window.__ttsTimer) { clearTimeout(window.__ttsTimer); window.__ttsTimer = null; }
+                        window.__ttsChars = [];
                         document.querySelectorAll('.tts-ch-active').forEach(function(s) { s.classList.remove('tts-ch-active'); });
-                        if (idx >= 0 && idx < window.__ttsChars.length) {
-                            window.__ttsChars[idx].classList.add('tts-ch-active');
-                        }
-                        updateTtsProgress(ratio);
-                        if (ratio < 1) {
-                            window.__ttsTimer = setTimeout(tick, 50);
-                        } else {
-                            setTimeout(removeTtsProgressBar, 300);
-                        }
-                    }
-                    tick();
-                };
-                window.__ttsStop = function() {
-                    if (window.__ttsTimer) { clearTimeout(window.__ttsTimer); window.__ttsTimer = null; }
-                    window.__ttsChars = [];
-                    document.querySelectorAll('.tts-ch-active').forEach(function(s) { s.classList.remove('tts-ch-active'); });
-                    removeTtsProgressBar();
-                };
+                        removeTtsProgressBar();
+                    };
+                } catch(e) {
+                    console.log('__TTS_DEBUG__:speakNatural_ERR ' + e.message);
+                }
             }
 
             function ttsExtractThai(text) {
@@ -2997,9 +3521,16 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             }
 
             function ttsSegmentAndWrap(li) {
+                ttsRestoreText(li);
                 var walker = document.createTreeWalker(li, NodeFilter.SHOW_TEXT, null, false);
                 var textNodes = [];
-                while (walker.nextNode()) { textNodes.push(walker.currentNode); }
+                while (walker.nextNode()) {
+                    var n = walker.currentNode;
+                    if (n.parentNode && n.parentNode.closest('.tts-progress-track, .tts-loading-badge, .li-save-btn, button')) {
+                        continue;
+                    }
+                    textNodes.push(n);
+                }
                 var charPos = 0;
                 textNodes.forEach(function(node) {
                     var text = node.textContent;
@@ -3060,55 +3591,114 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 setTimeout(function() { done(null); }, 3000);
             }
 
+            var prefetchedTexts = new Set();
+            function ttsPrefetchText(text) {
+                if (!text || text.length < 3) return;
+                if (prefetchedTexts.has(text)) return;
+                prefetchedTexts.add(text);
+                console.log('__TTS_CACHE__:' + text);
+            }
+
+            function ttsPrefetchLi(li) {
+                if (!li) return;
+                if (li.closest('.user-prompt, .query-text, [data-test-id="user-prompt"], user-query, [data-message-author-role="user"]')) return;
+                var t = ttsExtractThai(li.innerText || '');
+                if (t && t.length > 3) ttsPrefetchText(t);
+            }
+
+            function ttsPrefetchContainer(container, preferredIndex) {
+                if (!container) return;
+                var items = getVisibleLis(container);
+                if (!items || items.length === 0) return;
+                if (typeof preferredIndex === 'number' && preferredIndex >= 0 && preferredIndex < items.length) {
+                    for (var i = preferredIndex; i < items.length; i++) {
+                        ttsPrefetchLi(items[i]);
+                    }
+                    for (var j = preferredIndex - 1; j >= 0; j--) {
+                        ttsPrefetchLi(items[j]);
+                    }
+                } else {
+                    items.forEach(function(item) {
+                        ttsPrefetchLi(item);
+                    });
+                }
+            }
+
+            function ttsPrefetchAllPrompts() {
+                var responses = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
+                if (!responses || responses.length === 0) return;
+                for (var r = responses.length - 1; r >= 0; r--) {
+                    ttsPrefetchContainer(responses[r]);
+                }
+            }
+            window.ttsPrefetchAllPrompts = ttsPrefetchAllPrompts;
+
             function ttsPrefetchNeighbors(li) {
                 var container = li.closest('message-content, .model-response-text, [data-test-id="model-response"]');
                 if (!container) return;
                 var items = getVisibleLis(container);
                 var idx = items.indexOf(li);
                 if (idx < 0) return;
-                for (var d = -2; d <= 2; d++) {
-                    if (d === 0) continue;
-                    var ni = idx + d;
-                    if (ni >= 0 && ni < items.length) {
-                        var t = ttsExtractThai(items[ni].innerText || '');
-                        if (t) console.log('__TTS_CACHE__:' + t);
-                    }
-                }
+                ttsPrefetchContainer(container, idx + 1);
+                setTimeout(ttsPrefetchAllPrompts, 150);
             }
 
 
             function speakLi(li, waitForReady) {
-                ttsStop();
-                if (window.__ebookOfflineMode) return;
-                if (!li) return;
-                if (waitForReady && window.lastStatus !== 'DONE') {
-                    var retries = 0;
-                    var timer = setInterval(function() {
-                        retries++;
-                        if (window.lastStatus === 'DONE' || retries >= 60) {
-                            clearInterval(timer);
-                            speakNatural(li);
-                        }
-                    }, 500);
-                    return;
+                try {
+                    console.log('__TTS_DEBUG__:speakLi li=' + (li ? li.innerText.slice(0,25).trim() : 'null') + ' speakingLi=' + (ttsState.speakingLi ? 'set' : 'null') + ' isPlaying=' + window.__isTtsPlaying + ' isPrefetch=' + window.__isPrefetchWebview);
+                    if (ttsState.speakingLi === li && window.__isTtsPlaying) {
+                        console.log('__TTS_DEBUG__:speakLi SKIP-same-li-playing');
+                        return;
+                    }
+                    if (ttsState.speakingLi && ttsState.speakingLi !== li) {
+                        ttsStop();
+                    }
+                    if (!li) return;
+                    showTtsProgressBar(li);
+                    if (waitForReady && window.lastStatus !== 'DONE') {
+                        var retries = 0;
+                        var timer = setInterval(function() {
+                            retries++;
+                            if (window.lastStatus === 'DONE' || retries >= 60) {
+                                clearInterval(timer);
+                                speakNatural(li);
+                            }
+                        }, 500);
+                        return;
+                    }
+                    speakNatural(li);
+                } catch (err) {
+                    console.log('__TTS_DEBUG__:speakLi_ERR ' + err.message);
                 }
-                speakNatural(li);
             }
             // Public bridge for controls in the PDF pane.
             window.__ebookTtsStop = ttsStop;
             window.__ebookPdfCommand = function(command) {
-                var container = document.querySelector('message-content.focus-response-container, .model-response-text.focus-response-container, [data-test-id="model-response"].focus-response-container');
-                if (!container) { setupFocusMode(); container = document.querySelector('.focus-response-container'); }
+                var container = document.querySelector('.focus-response-container') ||
+                                document.querySelector('message-content, .model-response-text, [data-test-id="model-response"], [class*="canvas"], [class*="artifact"], .ql-editor') ||
+                                document.body;
+                if (!container) { setupFocusMode(); container = document.querySelector('.focus-response-container') || document.body; }
                 if (!container) return;
                 var items = getVisibleLis(container);
                 if (!items.length) return;
-                var idx = parseInt(container.dataset.focusIndex || '0');
-                if (idx < 0 || idx >= items.length) idx = Math.max(0, items.findIndex(function(li) { return li.classList.contains('active-focus'); }));
+                var activeIdx = items.findIndex(function(li) { return li.classList.contains('active-focus'); });
+                var idx = activeIdx !== -1 ? activeIdx : (parseInt((container.dataset && container.dataset.focusIndex) || '0') || 0);
+                if (idx < 0 || idx >= items.length) idx = 0;
                 if (command === 'save') {
-                    var saveBtn = items[idx].querySelector('.li-save-btn');
-                    if (saveBtn && !saveBtn.disabled) saveBtn.click();
+                    var currentLi = items[idx] || items[0];
+                    if (!currentLi) return;
+                    var saveBtn = currentLi.querySelector('.li-save-btn');
+                    if (!saveBtn) {
+                        attachSaveBtnToLi(currentLi);
+                        saveBtn = currentLi.querySelector('.li-save-btn');
+                    }
+                    if (saveBtn && !saveBtn.disabled) {
+                        saveBtn.click();
+                    }
                     return;
                 }
+                window.__pendingMoveAfterTts = null;
                 var nextIdx = command === 'next' ? idx + 1 : idx - 1;
                 if (nextIdx >= items.length) { console.log('__OFFLINE_SEQUENCE_END__'); console.log('__NEXT_PAGE__'); return; }
                 if (nextIdx < 0) return;
@@ -3119,6 +3709,79 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                 triggerHighlight(items[nextIdx]);
                 setTimeout(tagThaiKeywords, 50);
                 speakLi(items[nextIdx]);
+            };
+
+            // ระบบ Hands-Free Auto Read: ถ้าเมาส์ไม่ขยับ (user ปล่อยมือ) ให้อ่าน <li> ถัดไปเรื่อยๆ อัตโนมัติ
+            window.__ttsOnAudioEnded = function() {
+                if (window.__isPrefetchWebview) return;
+                window.__isTtsPlaying = false;
+                window.__currentTtsLi = null;
+
+                // ตรวจสอบว่ามีการ submit bigdata (เคลื่อนติ๊กถูก/คลิกขวา) รอให้ TTS อ่านจบก่อนเลื่อนไปข้อถัดไปหรือไม่
+                if (typeof window.__pendingMoveAfterTts === 'function') {
+                    var pendingFn = window.__pendingMoveAfterTts;
+                    window.__pendingMoveAfterTts = null;
+                    if (window.__autoAdvanceTimer) {
+                        clearTimeout(window.__autoAdvanceTimer);
+                        window.__autoAdvanceTimer = null;
+                    }
+                    pendingFn();
+                    return;
+                }
+
+                var now = Date.now();
+                var idleTime = now - lastMouseMoveTime;
+                // ถ้าเพิ่งขยับเมาส์ใน 1.5 วินาทีที่ผ่านมา ไม่ทำการ auto-advance เพื่อให้ user คุมเองได้ตามใจ
+                if (idleTime < 1500) {
+                    console.log('[Hands-Free TTS] Mouse active recently (' + idleTime + 'ms ago). Auto-advance paused.');
+                    return;
+                }
+
+                if (window.__autoAdvanceTimer) {
+                    clearTimeout(window.__autoAdvanceTimer);
+                    window.__autoAdvanceTimer = null;
+                }
+
+                console.log('[Hands-Free TTS] Mouse idle (' + idleTime + 'ms). Waiting 700ms then reading next <li>...');
+                window.__autoAdvanceTimer = setTimeout(function() {
+                    window.__autoAdvanceTimer = null;
+                    if (Date.now() - lastMouseMoveTime < 1500) {
+                        console.log('[Hands-Free TTS] Mouse moved during pause, cancelled.');
+                        return;
+                    }
+
+                    var container = document.querySelector('message-content.focus-response-container, .model-response-text.focus-response-container, [data-test-id="model-response"].focus-response-container');
+                    if (!container) {
+                        setupFocusMode();
+                        container = document.querySelector('.focus-response-container');
+                    }
+                    if (!container) return;
+
+                    var items = getVisibleLis(container);
+                    if (!items || items.length === 0) return;
+
+                    var currentIdx = items.findIndex(function(li) { return li.classList.contains('active-focus'); });
+                    if (currentIdx === -1) {
+                        currentIdx = parseInt(container.dataset.focusIndex || '0');
+                    }
+
+                    var nextIdx = currentIdx + 1;
+                    if (nextIdx < items.length) {
+                        console.log('[Hands-Free TTS] Auto-advancing to <li> item ' + (nextIdx + 1) + ' of ' + items.length);
+                        items.forEach(function(item) { item.classList.remove('active-focus'); });
+                        var nextLi = items[nextIdx];
+                        nextLi.classList.add('active-focus');
+                        container.dataset.focusIndex = nextIdx.toString();
+                        nextLi.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        triggerHighlight(nextLi);
+                        setTimeout(tagThaiKeywords, 50);
+                        speakLi(nextLi);
+                    } else {
+                        console.log('[Hands-Free TTS] Last <li> of response finished. Advancing page hands-free.');
+                        console.log('__OFFLINE_SEQUENCE_END__');
+                        console.log('__NEXT_PAGE__');
+                    }
+                }, 700);
             };
             // --- end TTS ---
 
@@ -3136,6 +3799,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                         attachSaveBtnToLi(li);
                     });
                 });
+                ttsPrefetchAllPrompts();
             }
 
             window.clickSend = function() { 
@@ -3330,6 +3994,11 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
             function checkStatus() {
                try {
+                  try {
+                      var tooltips = document.querySelectorAll('[role="tooltip"], [class*="help-bubble"], [class*="feature-discovery"], [class*="callout-content"], [class*="guide-dialog"]');
+                      tooltips.forEach(function(t) { t.remove(); });
+                  } catch (_) {}
+
                   var temp = document.querySelector('.stop-button, [aria-label*="Stop"], [aria-label*="หยุด"], [data-testid*="stop"], button[class*="stop"]');
                   var animating = document.querySelector('lottie-player, .generating-indicator, [class*="loading-indicator"], .loading-dots, div[class*="lottie"], div[class*="loading"]');
                   
@@ -3356,13 +4025,19 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                            console.log('__GEMINI_DONE__'); 
                            window.lastStatus = 'DONE'; 
                            requestLiImageCheck();
+                           ttsPrefetchAllPrompts();
                            var currentVisible = getVisibleLis();
-                           if (currentVisible.length > 0 && !ttsState.speakingLi && !window.__ebookOfflineMode && !window.__isPrefetchWebview) {
+                           if (currentVisible.length > 0 && !window.__isPrefetchWebview) {
                                var targetLi = currentVisible[0];
-                               currentVisible.forEach(function(l) { l.classList.remove('active-focus'); });
-                               targetLi.classList.add('active-focus');
-                               triggerHighlight(targetLi);
-                               speakLi(targetLi);
+                               if (!ttsState.speakingLi || !ttsState.speakingLi.isConnected || ttsState.speakingLi !== targetLi) {
+                                   currentVisible.forEach(function(l) { l.classList.remove('active-focus'); });
+                                   targetLi.classList.add('active-focus');
+                                   showTtsProgressBar(targetLi);
+                                   triggerHighlight(targetLi);
+                                   speakLi(targetLi);
+                               } else if (!targetLi.querySelector('.tts-progress-track')) {
+                                   showTtsProgressBar(targetLi);
+                               }
                            } else if (!autoReadDone) {
                                triggerFastFirstLiRead();
                            }
@@ -3382,7 +4057,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             function requestLiImageCheck() {
                 if (checkImagesDebounce) clearTimeout(checkImagesDebounce);
                 checkImagesDebounce = setTimeout(function() {
-                    var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
+                    var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"], [class*="canvas"], [class*="artifact"], .ql-editor');
                     if (resp.length === 0) return;
                     var container = resp[resp.length - 1];
                     var allLis = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
@@ -3393,7 +4068,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             }
 
             window.applyLiImageFilter = function(imageIndices) {
-                var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
+                var resp = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"], [class*="canvas"], [class*="artifact"], .ql-editor');
                 if (resp.length === 0) return;
                 var container = resp[resp.length - 1];
                 var allLis = Array.from(container.querySelectorAll('li')).filter(function(l) { return l.innerText.trim().length > 5; });
@@ -3433,20 +4108,27 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
             };
 
             function triggerFastFirstLiRead(preferredLi) {
-                if (window.__ebookOfflineMode || window.__isPrefetchWebview) return;
+                if (window.__isPrefetchWebview) return;
                 var visible = getVisibleLis();
                 if (visible.length === 0) return;
 
                 var target = preferredLi || visible[0];
                 if (!target) return;
 
+                target.style.setProperty('position', 'relative', 'important');
+                target.classList.add('active-focus');
+
+                // แสดง loading progress รออ่าน tts ของ <li> แรกทันที
+                if (!target.querySelector('.tts-progress-track')) {
+                    showTtsProgressBar(target);
+                }
+
                 var rawText = (target.innerText || '').trim();
                 if (visible.length >= 2 || rawText.length >= 12) {
-                    if (ttsState.speakingLi === target) return;
+                    if (ttsState.speakingLi === target && target.querySelector('.tts-progress-track') && window.__isTtsPlaying) return;
                     autoReadDone = true;
                     if (autoReadTimer) { clearTimeout(autoReadTimer); autoReadTimer = null; }
-                    visible.forEach(function(l) { l.classList.remove('active-focus'); });
-                    target.classList.add('active-focus');
+                    visible.forEach(function(l) { if (l !== target) l.classList.remove('active-focus'); });
                     triggerHighlight(target);
                     speakLi(target);
                 } else if (!autoReadTimer) {
@@ -3463,7 +4145,8 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
             // Init
             window.addEventListener('scroll', handleScroll, true);
-            setInterval(checkStatus, 500);
+            if (window.__geminiCheckStatusTimer) clearInterval(window.__geminiCheckStatusTimer);
+            window.__geminiCheckStatusTimer = setInterval(checkStatus, 500);
 
             // MutationObserver: observe document.body เพื่อจับ response container ใหม่
             // แล้ว observe เฉพาะ container นั้นสำหรับ li ที่ stream เข้ามา
@@ -3531,7 +4214,7 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
 
             // observe body เพื่อจับ response container ใหม่
             var bodyObserver = new MutationObserver(function(mutations) {
-                var responses = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"]');
+                var responses = document.querySelectorAll('message-content, .model-response-text, [data-test-id="model-response"], [class*="canvas"], [class*="artifact"], .ql-editor');
                 responses.forEach(function(resp) {
                     observeResponseContainer(resp);
                 });
@@ -3543,9 +4226,12 @@ async function injectGeminiScript(targetWebview = geminiWebview) {
                     tagThaiKeywords();
                     attachNextPageButton();
                     loadKaTeX();
+                    ttsPrefetchAllPrompts();
                 }, 600);
             });
 
+            if (window.__geminiBodyObserver) window.__geminiBodyObserver.disconnect();
+            window.__geminiBodyObserver = bodyObserver;
             bodyObserver.observe(document.body, { childList: true, subtree: true });
 
             // attach ครั้งแรกตอน inject
@@ -3610,7 +4296,6 @@ async function loadPDF(fileData) {
     try {
         currentFilePath = fileData.path;
         currentFileName = fileData.name;
-        restoreOfflineModeForCurrentDocument();
         fileName.textContent = currentFileName;
         pageTextMap = {}; // ล้างข้อความเก่า
 
@@ -3629,7 +4314,7 @@ async function loadPDF(fileData) {
         if (savedProgress && savedProgress.batchSize) {
             batchSize = savedProgress.batchSize;
         } else {
-            batchSize = isOfflineMode ? 1 : getOnlineBatchSize(totalPages);
+            batchSize = getOnlineBatchSize(totalPages);
         }
         if (batchSizeInput) batchSizeInput.value = batchSize;
         showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า`, 'info');
@@ -3652,7 +4337,6 @@ async function loadPDFFromFile(file) {
     try {
         currentFileName = file.name;
         currentFilePath = file.path || file.name;
-        restoreOfflineModeForCurrentDocument();
         fileName.textContent = currentFileName;
         pageTextMap = {}; // ล้างข้อความเก่า
 
@@ -3675,7 +4359,7 @@ async function loadPDFFromFile(file) {
         if (savedProgress && savedProgress.batchSize) {
             batchSize = savedProgress.batchSize;
         } else {
-            batchSize = isOfflineMode ? 1 : getOnlineBatchSize(totalPages);
+            batchSize = getOnlineBatchSize(totalPages);
         }
         if (batchSizeInput) batchSizeInput.value = batchSize;
         showToast(`ตั้งค่าสรุปทีละ ${batchSize} หน้า`, 'info');
@@ -4409,7 +5093,7 @@ async function renderKeysPages() {
             pdfContainer.appendChild(wrapper);
 
             const viewport = page.getViewport({ scale: scale });
-            const ctx = canvas.getContext('2d');
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
             canvas.height = viewport.height;
             canvas.width = viewport.width;
 
@@ -4503,7 +5187,7 @@ async function captureIllustrationsOffscreen(start, end) {
             const canvas = document.createElement('canvas');
             canvas.width = viewport.width;
             canvas.height = viewport.height;
-            const ctx = canvas.getContext('2d');
+            const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
             await page.render({ canvasContext: ctx, viewport: viewport }).promise;
 
@@ -4703,8 +5387,10 @@ async function goToPage(pageNum) {
                                 if (items.length > 0) {
                                     items.forEach(function(l) { l.classList.remove('active-focus'); });
                                     items[0].classList.add('active-focus');
+                                    items[0].style.position = 'relative';
                                     c.dataset.focusIndex = '0';
                                     if (typeof triggerHighlight === 'function') triggerHighlight(items[0]);
+                                    if (typeof showTtsProgressBar === 'function') showTtsProgressBar(items[0]);
                                     if (typeof speakLi === 'function') speakLi(items[0]);
                                 }
                             }
@@ -4969,6 +5655,7 @@ async function fetchLatestBigdataInfoFromGitHub() {
         let num = 1;
         let lastFileWithItems = null;
         let lastLineCountWithItems = 0;
+        let lastSnippet = '';
         let firstFile = 'bigdata1.json';
 
         while (true) {
@@ -4980,6 +5667,10 @@ async function fetchLatestBigdataInfoFromGitHub() {
             if (items && items.length > 0) {
                 lastFileWithItems = candidate;
                 lastLineCountWithItems = items.length + 1;
+                const lastItem = items[items.length - 1];
+                if (lastItem && typeof lastItem.data === 'string') {
+                    lastSnippet = lastItem.data.slice(0, 40).trim();
+                }
             } else if (num === 1) {
                 firstFile = candidate;
             }
@@ -4993,34 +5684,53 @@ async function fetchLatestBigdataInfoFromGitHub() {
 
         if (lastFileWithItems && lastLineCountWithItems > 0) {
             // บันทึกและแสดงผลไฟล์และบรรทัดล่าสุดของ <li> ที่บันทึกสำเร็จลง localStorage
-            updateLatestBigdataDisplay(lastFileWithItems, lastLineCountWithItems);
+            updateLatestBigdataDisplay(lastFileWithItems, lastLineCountWithItems, lastSnippet);
         } else if (firstFile) {
-            updateLatestBigdataDisplay(firstFile, 1);
+            updateLatestBigdataDisplay(firstFile, 1, '');
         }
     } catch (err) {
         console.warn('Failed to fetch latest BigData info from GitHub:', err);
     }
 }
 
-function updateLatestBigdataDisplay(filename, line) {
+function updateLatestBigdataDisplay(filename, line, snippet) {
     const el = document.getElementById('latestBigdataInfo');
     if (!el) return;
+
     if (filename && line) {
-        el.innerHTML = `<span class="bigdata-file">💾 ${filename}</span> <span class="bigdata-line">(บรรทัด ${line})</span>`;
-        el.style.display = 'inline-flex';
         localStorage.setItem('latestBigdataFile', filename);
         localStorage.setItem('latestBigdataLine', String(line));
-    } else {
-        const savedFile = localStorage.getItem('latestBigdataFile');
-        const savedLine = localStorage.getItem('latestBigdataLine');
-        if (savedFile && savedLine) {
-            el.innerHTML = `<span class="bigdata-file">💾 ${savedFile}</span> <span class="bigdata-line">(บรรทัด ${savedLine})</span>`;
-            el.style.display = 'inline-flex';
-        } else {
-            el.innerHTML = `<span class="bigdata-file">💾 bigdata1.json</span> <span class="bigdata-line">(บรรทัด 1)</span>`;
-            el.style.display = 'inline-flex';
-            fetchLatestBigdataInfoFromGitHub();
+        if (snippet !== undefined && snippet !== null) {
+            localStorage.setItem('latestBigdataSnippet', snippet);
         }
+    } else {
+        filename = localStorage.getItem('latestBigdataFile');
+        line = localStorage.getItem('latestBigdataLine');
+        snippet = localStorage.getItem('latestBigdataSnippet');
+    }
+
+    function cleanStr(s) {
+        return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    if (filename && line) {
+        const snippetText = snippet || localStorage.getItem('latestBigdataSnippet') || '';
+        const snippetHtml = snippetText ? `<span class="bigdata-snippet" title="${cleanStr(snippetText)}">: ${cleanStr(snippetText)}</span>` : '';
+        el.innerHTML = `
+            <span class="bigdata-badge">💾</span>
+            <span class="bigdata-file">${cleanStr(filename)}</span>
+            <span class="bigdata-line">บรรทัด ${cleanStr(String(line))}</span>
+            ${snippetHtml}
+        `;
+        el.style.display = 'flex';
+    } else {
+        el.innerHTML = `
+            <span class="bigdata-badge">💾</span>
+            <span class="bigdata-file">bigdata1.json</span>
+            <span class="bigdata-line">บรรทัด 1</span>
+        `;
+        el.style.display = 'flex';
+        fetchLatestBigdataInfoFromGitHub();
     }
 }
 
@@ -5045,7 +5755,12 @@ async function putGitHubFile(filename, contentObj, sha, options = null, retries 
             });
             if (res.ok) {
                 const lineNo = contentObj.length + 1;
-                updateLatestBigdataDisplay(filename, lineNo);
+                const lastItem = contentObj[contentObj.length - 1];
+                let snippet = '';
+                if (lastItem && typeof lastItem.data === 'string') {
+                    snippet = lastItem.data.slice(0, 40).trim();
+                }
+                updateLatestBigdataDisplay(filename, lineNo, snippet);
                 if (!options || !options.silent) showToast('บันทึกที่ ' + filename + ' (บรรทัด ' + lineNo + ') ✓', 'success');
                 return { ok: true, filename, line: lineNo };
             } else if (res.status === 409) {
@@ -5194,8 +5909,6 @@ async function saveAppSettings() {
             detectedAccounts,
             currentAccountIndex,
             isAutoRotateAccounts,
-            offlineDocuments,
-
         });
     } catch (e) {
         console.error('Error saving app settings:', e);
@@ -5216,8 +5929,6 @@ async function loadAppSettings() {
             if (settings.isAutoRotateAccounts !== undefined) {
                 isAutoRotateAccounts = settings.isAutoRotateAccounts;
             }
-            if (settings.offlineDocuments && typeof settings.offlineDocuments === 'object') offlineDocuments = settings.offlineDocuments;
-
         }
 
         // Update UI
@@ -5239,9 +5950,6 @@ async function loadAppSettings() {
         if (autoRotateAccountsCheckbox) {
             autoRotateAccountsCheckbox.checked = isAutoRotateAccounts;
         }
-        // App startup always defaults to Online. A document can opt in after it is opened.
-        isOfflineMode = false;
-        updateOfflineModeUi();
     } catch (e) {
         console.error('Error loading app settings:', e);
     }
@@ -5440,6 +6148,7 @@ async function preSummarizeNextBatch(textToSummarize, startPage, endPage, illust
 
         const prompt = `สรุปเนื้อหาจาก PDF จำนวน ${batchSize} หน้า (หน้าที่ ${startPage} ถึง ${endPage}) เป็นภาษาไทย:
 - สรุปแบ่งเป็นประเด็นสำคัญๆ ให้ครอบคลุมเนื้อหาทั้งหมด
+- ตอบในแชทนี้โดยตรงในรูปแบบรายการ bullet points เท่านั้น (ห้ามเปิด Canvas และห้ามสร้าง Docs/Artifact document)
 - ใช้รายการหัวข้อย่อย (Bullet points) ที่กระชับและเข้าใจง่าย ให้เป็น <li> เดียว อย่าซ้อน
 - **รูปแบบบังคับ:** ทุกหัวข้อต้องใช้รูปแบบ: **คำภาษาไทย (EnglishAnchor, Alias1)**: คำอธิบาย...
 - **กฎสำคัญมากเรื่องวงเล็บ:**
@@ -5654,6 +6363,7 @@ async function sendToGemini(textToSummarize, startPage, endPage, illustrationIma
 
         const prompt = `สรุปเนื้อหาจาก PDF จำนวน ${batchSize} หน้า (หน้าที่ ${startPage} ถึง ${endPage}) เป็นภาษาไทย:
 - สรุปแบ่งเป็นประเด็นสำคัญๆ ให้ครอบคลุมเนื้อหาทั้งหมด
+- ตอบในแชทนี้โดยตรงในรูปแบบรายการ bullet points เท่านั้น (ห้ามเปิด Canvas และห้ามสร้าง Docs/Artifact document)
 - ใช้รายการหัวข้อย่อย (Bullet points) ที่กระชับและเข้าใจง่าย ให้เป็น <li> เดียว อย่าซ้อน
 - **รูปแบบบังคับ:** ทุกหัวข้อต้องใช้รูปแบบ: **คำภาษาไทย (EnglishAnchor, Alias1)**: คำอธิบาย...
 - **กฎสำคัญมากเรื่องวงเล็บ:**
@@ -6158,25 +6868,17 @@ function showToast(message, type = 'info') {
 }
 
 function updateOfflineModeUi() {
-    const offlineModeToggle = document.getElementById('offlineModeToggle');
-    const offlineModeLabel = document.getElementById('offlineModeLabel');
-    if (offlineModeToggle) offlineModeToggle.checked = isOfflineMode;
-    if (offlineModeLabel) offlineModeLabel.textContent = isOfflineMode ? 'Offline' : 'Online';
 }
 
 function restoreOfflineModeForCurrentDocument() {
-    const key = `document:${currentFileName.toLowerCase()}`;
-    isOfflineMode = !!offlineDocuments[key];
-    updateOfflineModeUi();
     setOfflineModeForWebviews();
 }
 
 function setOfflineModeForWebviews() {
     [geminiWebview, prefetchWebview].forEach((webview) => {
         if (!webview) return;
-        webview.executeJavaScript(`window.__ebookOfflineMode = ${isOfflineMode ? 'true' : 'false'}; window.__ebookTtsStop && window.__ebookTtsStop();`).catch(() => {});
+        webview.executeJavaScript('window.__ebookOfflineMode = false;').catch(() => {});
     });
-    if (isOfflineMode) stopActiveTts();
 }
 
 // PDF and Gemini live in different panes.  These controls intentionally keep the
@@ -6276,7 +6978,15 @@ function stopActiveTts() {
         window.__edgeAudio.remove();
         window.__edgeAudio = null;
     }
-    if (geminiWebview) geminiWebview.executeJavaScript('window.__ebookTtsStop && window.__ebookTtsStop()').catch(() => {});
+    if (window.speechSynthesis) {
+        try { window.speechSynthesis.cancel(); } catch (e) {}
+    }
+    const webviews = [geminiWebview, prefetchWebview].filter(Boolean);
+    webviews.forEach(wv => {
+        try {
+            wv.executeJavaScript('window.__ebookTtsStop && window.__ebookTtsStop()').catch(() => {});
+        } catch (e) {}
+    });
 }
 
 function showPdfSaveMark(x, y) {
@@ -6340,16 +7050,7 @@ function setupPdfTabControls() {
                 end.x - start.x >= 35 && strokeTime >= 100 && strokeTime <= 600;
         }
         if (isCheck) {
-            if (isOfflineMode) {
-                if (currentPage + batchSize <= totalPages) {
-                    goToPage(currentPage + batchSize);
-                    showToast('เปลี่ยนหน้าถัดไป', 'info');
-                } else {
-                    showToast('ถึงหน้าสุดท้ายแล้ว', 'info');
-                }
-            } else {
-                runGeminiReadingCommand('save');
-            }
+            runGeminiReadingCommand('save');
             showPdfSaveMark(e.clientX, e.clientY);
             lastCheckSaveAt = now;
             mouseTrail = [];
