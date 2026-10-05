@@ -30,5 +30,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     loadSettings: () => ipcRenderer.invoke('load-settings'),
     getGithubToken: () => ipcRenderer.invoke('get-github-token'),
     saveOfflineSummary: (data) => ipcRenderer.invoke('save-offline-summary', data),
-    edgeSpeak: (text) => ipcRenderer.invoke('edge-tts-speak', text)
+    edgeSpeak: (text) => ipcRenderer.invoke('edge-tts-speak', text),
+    onAppMinimized: (callback) => {
+        const listener = () => callback();
+        ipcRenderer.on('app-minimized', listener);
+        return () => ipcRenderer.removeListener('app-minimized', listener);
+    }
 });
