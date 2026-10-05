@@ -95,6 +95,26 @@ function createWindow() {
   const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
   session.defaultSession.setUserAgent(chromeUA);
 
+  const partitionSession = session.fromPartition('persist:google_secure_v2');
+  partitionSession.setUserAgent(chromeUA);
+
+  // Block native desktop notifications for all sessions
+  [session.defaultSession, partitionSession].forEach(ses => {
+    ses.setPermissionRequestHandler((webContents, permission, callback) => {
+      if (permission === 'notifications') {
+        return callback(false);
+      }
+      callback(true);
+    });
+
+    ses.setPermissionCheckHandler((webContents, permission) => {
+      if (permission === 'notifications') {
+        return false;
+      }
+      return true;
+    });
+  });
+
   mainWindow.loadFile('index.html');
   mainWindow.maximize();
 
@@ -119,6 +139,17 @@ function createWindow() {
   });
 
   mainWindow.webContents.on('did-attach-webview', (event, webContents) => {
+    if (webContents.session) {
+      webContents.session.setPermissionRequestHandler((wc, permission, callback) => {
+        if (permission === 'notifications') return callback(false);
+        callback(true);
+      });
+      webContents.session.setPermissionCheckHandler((wc, permission) => {
+        if (permission === 'notifications') return false;
+        return true;
+      });
+    }
+
     webContents.setWindowOpenHandler(({ url }) => {
       if (url.startsWith('https://accounts.google.com')) {
         return {
@@ -131,6 +162,12 @@ function createWindow() {
       }
       return { action: 'deny' };
     });
+  });
+
+  mainWindow.on('minimize', () => {
+    if (mainWindow && mainWindow.webContents) {
+      mainWindow.webContents.send('app-minimized');
+    }
   });
 }
 
